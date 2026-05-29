@@ -36,7 +36,7 @@ use crate::instr_types::{
 use crate::instruction::{Instruction, InstructionKindData};
 use crate::marker::Dyn;
 use crate::module::Module;
-use crate::r#type::{Type, TypeData};
+use crate::r#type::{StructBody, Type, TypeData};
 use crate::value::{Value, ValueId, ValueKindData};
 
 // --------------------------------------------------------------------------
@@ -1614,6 +1614,35 @@ pub(crate) fn fmt_function(
     f.write_str("}\n")
 }
 
+/// Print a struct body inline: `{ <elem>, ... }` (or `<{ ... }>` when
+/// packed). Mirrors the literal-struct arm of `Type`'s `Display`
+/// (`type.rs`), recursing into elements via `Type::new` — which renders a
+/// *named* element as `%Name` and any other type structurally.
+fn fmt_struct_body(
+    f: &mut fmt::Formatter<'_>,
+    body: &StructBody,
+    m: &Module<'_>,
+) -> fmt::Result {
+    if body.packed {
+        f.write_str("<{ ")?;
+    } else {
+        f.write_str("{ ")?;
+    }
+    let mut first = true;
+    for e in body.elements.iter() {
+        if !first {
+            f.write_str(", ")?;
+        }
+        first = false;
+        write!(f, "{}", Type::new(*e, m))?;
+    }
+    if body.packed {
+        f.write_str(" }>")
+    } else {
+        f.write_str(" }")
+    }
+}
+
 pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Result {
     writeln!(f, "; ModuleID = '{}'", m.name())?;
 
@@ -1659,6 +1688,36 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
         f.write_str("\n")?;
         for c in comdats_iter.by_ref() {
             fmt_comdat(f, c)?;
+        }
+    }
+
+    // Named-struct type identities. Mirrors the `printTypeIdentities`
+    // call in `AssemblyWriter::printModule`, emitted between comdats and
+    // globals: a leading blank line if any exist, then one
+    // `%Name = type {...}` (or `%Name = type opaque`) line per struct in
+    // declaration order.
+    {
+        let struct_ids = m.iter_named_struct_ids();
+        if !struct_ids.is_empty() {
+            f.write_str("\n")?;
+            for id in struct_ids {
+                let data = m.context().type_data(id);
+                let s = data
+                    .as_struct()
+                    .expect("iter_named_struct_ids yields only struct ids");
+                let name = s
+                    .name
+                    .as_ref()
+                    .expect("named struct must have a name");
+                write!(f, "%{name} = type ")?;
+                match s.body.borrow().as_ref() {
+                    Some(body) => fmt_struct_body(f, body, m)?,
+                    // KirpiIR never creates opaque structs, but be faithful
+                    // to LLVM, which prints those as `%Name = type opaque`.
+                    None => f.write_str("opaque")?,
+                }
+                f.write_str("\n")?;
+            }
         }
     }
 

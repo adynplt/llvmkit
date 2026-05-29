@@ -228,6 +228,14 @@ impl<'ctx> Module<'ctx> {
         &self.ctx
     }
 
+    /// Named-struct type ids in declaration order. The printer turns each
+    /// into a [`Type`](crate::r#type::Type) via `Type::new(id, self)` to emit
+    /// the `%Name = type {...}` identity block.
+    #[inline]
+    pub(crate) fn iter_named_struct_ids(&self) -> Vec<crate::r#type::TypeId> {
+        self.ctx.iter_named_structs()
+    }
+
     // ---- Primitive type constructors ----
 
     /// `void`.
