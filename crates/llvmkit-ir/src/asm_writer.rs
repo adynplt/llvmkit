@@ -219,6 +219,11 @@ pub(crate) fn fmt_operand_ref(
             write!(f, "@{}", v.name().unwrap_or_default())
         }
         ValueKindData::Constant(c) => fmt_constant(f, v, c),
+        // `MetadataAsValue` prints just the `!N` reference; the
+        // surrounding `metadata` type comes from `fmt_operand` /
+        // `fmt_call` printing `{ty} {ref}`. Mirrors AsmWriter's
+        // `writeOperand` for a `MetadataAsValue` operand.
+        ValueKindData::MetadataAsValue(id) => write!(f, "!{}", id.index()),
     }
 }
 
@@ -1619,6 +1624,10 @@ pub(crate) fn fmt_function(
     if let Some(kw) = func.unnamed_addr().keyword() {
         write!(f, " {kw}")?;
     }
+    // Function-level attribute slot. Printed inline after the signature,
+    // e.g. `define void @f() naked "frame-pointer"="all" {`. Mirrors the
+    // function-attribute portion of `AsmWriter::printFunction`.
+    fmt_attribute_set(f, &attrs, AttrIndex::Function, true)?;
     if header == "declare" {
         return f.write_str("\n");
     }
@@ -1764,8 +1773,19 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
         let md = m.metadata_store();
         let nodes = md.nodes();
         if !nodes.is_empty() {
-            f.write_str("\n")?;
+            // `MDString`s referenced from a tuple are printed inline in
+            // that tuple's body, never as standalone `!N = !"..."` nodes
+            // (which `clang` rejects). Skip them in the numbered listing.
+            let inlined = inlined_string_ids(nodes);
+            let mut wrote_header = false;
             for (i, node) in nodes.iter().enumerate() {
+                if inlined.contains(&i) {
+                    continue;
+                }
+                if !wrote_header {
+                    f.write_str("\n")?;
+                    wrote_header = true;
+                }
                 write!(f, "!{i} = ")?;
                 fmt_metadata_node(f, node, &md)?;
                 f.write_str("\n")?;
@@ -1796,10 +1816,15 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
 
 /// Print one metadata node body. Mirrors `WriteMDNodeBodyInternal` in
 /// `lib/IR/AsmWriter.cpp`.
+///
+/// Tuple operands that resolve to an `MDString` are printed *inline*
+/// (`!{!"rsp"}`) rather than as a numbered reference. LLVM never numbers
+/// `MDString`s as standalone nodes — a top-level `!N = !"..."` is rejected
+/// by `clang`/`llvm-as` — so inlining keeps the emitted module parseable.
 fn fmt_metadata_node(
     f: &mut fmt::Formatter<'_>,
     node: &crate::metadata::MetadataKind,
-    _store: &crate::metadata::MetadataStore,
+    store: &crate::metadata::MetadataStore,
 ) -> fmt::Result {
     use crate::metadata::MetadataKind;
     match node {
@@ -1814,7 +1839,7 @@ fn fmt_metadata_node(
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "!{}", op.0.index())?;
+                fmt_metadata_operand(f, op.0, store)?;
             }
             f.write_str("}")
         }
@@ -1822,6 +1847,43 @@ fn fmt_metadata_node(
             write!(f, "!{}", id.index())
         }
     }
+}
+
+/// Print a single metadata operand. An `MDString` operand is inlined as
+/// `!"..."`; anything else is a numbered reference `!N`.
+fn fmt_metadata_operand(
+    f: &mut fmt::Formatter<'_>,
+    id: crate::metadata::MetadataId,
+    store: &crate::metadata::MetadataStore,
+) -> fmt::Result {
+    match store.get(id) {
+        Some(crate::metadata::MetadataKind::String(s)) => {
+            f.write_str("!\"")?;
+            print_escaped_string(f, s.as_bytes())?;
+            f.write_str("\"")
+        }
+        _ => write!(f, "!{}", id.index()),
+    }
+}
+
+/// Collect the ids of every `MDString` node that is referenced as a tuple
+/// operand. Such strings are emitted *inline* in the tuple body, so they
+/// must be skipped in the top-level numbered-node listing (a standalone
+/// `!N = !"..."` is not valid LLVM textual IR).
+fn inlined_string_ids(nodes: &[crate::metadata::MetadataKind]) -> std::collections::HashSet<usize> {
+    use crate::metadata::MetadataKind;
+    let mut set = std::collections::HashSet::new();
+    for node in nodes {
+        if let MetadataKind::Tuple(operands) = node {
+            for op in operands {
+                let idx = op.0.index();
+                if matches!(nodes.get(idx), Some(MetadataKind::String(_))) {
+                    set.insert(idx);
+                }
+            }
+        }
+    }
+    set
 }
 
 fn fmt_comdat(f: &mut fmt::Formatter<'_>, c: crate::comdat::ComdatRef<'_>) -> fmt::Result {

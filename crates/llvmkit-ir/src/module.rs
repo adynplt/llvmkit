@@ -935,11 +935,38 @@ impl<'ctx> Module<'ctx> {
     }
 
     /// Create a metadata tuple node. Mirrors `MDTuple::get` (distinct).
+    ///
+    /// Accepts anything that borrows as a slice of
+    /// [`MetadataRef`](crate::metadata::MetadataRef) — both an owned
+    /// `Vec` and a borrowed `&[..]` work.
     pub fn metadata_tuple(
         &self,
-        operands: Vec<crate::metadata::MetadataRef>,
+        operands: impl AsRef<[crate::metadata::MetadataRef]>,
     ) -> crate::metadata::MetadataId {
-        self.metadata.borrow_mut().get_tuple(operands)
+        self.metadata.borrow_mut().get_tuple(operands.as_ref().to_vec())
+    }
+
+    /// Wrap a metadata node as a [`Value`](crate::value::Value) so it can
+    /// be used where a value is expected — e.g. as a `metadata`-typed
+    /// argument to a `call` (the named-register intrinsics
+    /// `@llvm.read_register` / `@llvm.write_register`). Mirrors LLVM's
+    /// `MetadataAsValue::get`.
+    ///
+    /// The returned value has the module's `metadata` type, implements
+    /// [`IsValue`](crate::value::IsValue), and can be passed straight into
+    /// [`build_call`](crate::ir_builder::IRBuilder::build_call). It is
+    /// context-global: it carries no function-local SSA definition and is
+    /// never assigned a `%N` slot; it prints as the bare `!N` reference.
+    pub fn metadata_as_value(&'ctx self, md: crate::metadata::MetadataId) -> crate::value::Value<'ctx> {
+        let ty = self.ctx.metadata();
+        let id = self.ctx.push_value(crate::value::ValueData {
+            ty,
+            name: core::cell::RefCell::new(None),
+            debug_loc: None,
+            kind: crate::value::ValueKindData::MetadataAsValue(md),
+            use_list: core::cell::RefCell::new(Vec::new()),
+        });
+        crate::value::Value::from_parts(id, self, ty)
     }
 
     /// Look up a metadata node by id.

@@ -54,6 +54,11 @@ fn standalone_metadata_empty_tuple() {
 }
 
 /// `!0 = !"str"` followed by `!1 = !{!0}` — tuple referencing a string.
+///
+/// An `MDString` operand is printed inline in the tuple body
+/// (`!1 = !{!"hello"}`) rather than as a numbered `!0` reference: LLVM
+/// never numbers `MDString`s as standalone nodes, and a top-level
+/// `!0 = !"hello"` is rejected by `clang`/`llvm-as`.
 #[test]
 fn standalone_metadata_tuple_with_ref() {
     let src = r#"
@@ -62,10 +67,12 @@ fn standalone_metadata_tuple_with_ref() {
 "#;
     let (m, text) = parse_snippet(src);
     assert_eq!(m.metadata_count(), 2);
-    assert!(text.contains("!1 = !{!0}"), "output: {text}");
+    assert!(text.contains(r#"!1 = !{!"hello"}"#), "output: {text}");
+    // The inlined string is not emitted as a standalone numbered node.
+    assert!(!text.contains(r#"!0 = !"hello""#), "output: {text}");
 }
 
-/// Multi-operand tuple.
+/// Multi-operand tuple. `MDString` operands inline into the tuple body.
 #[test]
 fn standalone_metadata_tuple_multi_operand() {
     let src = r#"
@@ -75,7 +82,7 @@ fn standalone_metadata_tuple_multi_operand() {
 "#;
     let (m, text) = parse_snippet(src);
     assert_eq!(m.metadata_count(), 3);
-    assert!(text.contains("!2 = !{!0, !1}"), "output: {text}");
+    assert!(text.contains(r#"!2 = !{!"a", !"b"}"#), "output: {text}");
 }
 
 /// `distinct` keyword is accepted and transparent.
@@ -207,4 +214,51 @@ define i32 @f(i32 %x) {
 !0 = !{}
 "#;
     let (_, _text) = parse_snippet(src);
+}
+
+// ── `metadata` as a call argument (MetadataAsValue) ──────────────────────
+
+/// A `call` whose argument is a `metadata` node — the shape the
+/// named-register intrinsics (`@llvm.read_register`,
+/// `@llvm.write_register`) require. The `metadata !N` operand parses
+/// back to a `MetadataAsValue` and re-prints unchanged.
+/// Mirrors `test/CodeGen/Generic/read-write-register.ll`.
+#[test]
+fn call_with_metadata_argument_roundtrip() {
+    let src = r#"
+declare i64 @llvm.read_register.i64(metadata)
+
+define i64 @get_sp() {
+  %rsp = call i64 @llvm.read_register.i64(metadata !0)
+  ret i64 %rsp
+}
+
+!0 = !{}
+"#;
+    let (_, text) = parse_snippet(src);
+    assert!(
+        text.contains("call i64 @llvm.read_register.i64(metadata !0)"),
+        "output: {text}"
+    );
+}
+
+/// `void`-returning `write_register` variant: a `metadata` argument
+/// followed by a normal SSA value argument.
+#[test]
+fn call_with_metadata_and_value_argument_roundtrip() {
+    let src = r#"
+declare void @llvm.write_register.i64(metadata, i64)
+
+define void @set_sp(i64 %v) {
+  call void @llvm.write_register.i64(metadata !0, i64 %v)
+  ret void
+}
+
+!0 = !{}
+"#;
+    let (_, text) = parse_snippet(src);
+    assert!(
+        text.contains("call void @llvm.write_register.i64(metadata !0, i64 %v)"),
+        "output: {text}"
+    );
 }

@@ -4097,6 +4097,18 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                     })
                 }
             }
+            // `metadata !N` — a metadata node used as a value (LLVM's
+            // `MetadataAsValue`), e.g. a `call` argument to
+            // `@llvm.read_register` / `@llvm.write_register`. The `ty`
+            // (`metadata`) has already been consumed; here we read the
+            // `!N` reference and wrap the node as a value.
+            Token::Exclaim => {
+                let _ = ty;
+                self.bump()?; // consume '!'
+                let slot = self.parse_uint32("metadata slot number after '!'")?;
+                let id = llvmkit_ir::metadata::MetadataId::from_index(slot as usize);
+                Ok(self.module.metadata_as_value(id))
+            }
             _ => Err(self.expected("operand value")),
         }
     }
