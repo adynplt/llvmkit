@@ -36,7 +36,7 @@ use crate::instr_types::{
 use crate::instruction::{Instruction, InstructionKindData};
 use crate::marker::Dyn;
 use crate::module::Module;
-use crate::r#type::{Type, TypeData};
+use crate::r#type::{StructBody, Type, TypeData};
 use crate::value::{Value, ValueId, ValueKindData};
 
 // --------------------------------------------------------------------------
@@ -238,6 +238,17 @@ pub(crate) fn fmt_constant(
         ConstantData::Undef => f.write_str("undef"),
         ConstantData::Poison => f.write_str("poison"),
         ConstantData::Aggregate(elems) => fmt_aggregate_constant(f, host, elems),
+        ConstantData::GepOffset { base_id, off } => {
+            // `getelementptr inbounds (i8, ptr @<base>, i64 <off>)` — the lone
+            // ConstantExpr form we materialise. The base value (a global or
+            // function) prints by name; the i8 element type makes the offset a
+            // raw byte count.
+            let module = host.module.module();
+            let base = Value::from_parts(*base_id, module, module.context().value_data(*base_id).ty);
+            f.write_str("getelementptr inbounds (i8, ptr ")?;
+            fmt_operand_ref(f, base, None)?;
+            write!(f, ", i64 {off})")
+        }
     }
 }
 
@@ -273,6 +284,12 @@ fn fmt_int_constant(f: &mut fmt::Formatter<'_>, ty: Type<'_>, words: &[u64]) -> 
     // prefix to mark unsigned. Mirrors LLVM's APInt textual fallback
     // for widths >64.
     f.write_str("u0x")?;
+    // A zero magnitude normalises to an empty `words` slice; emit a single
+    // `0` digit so the result is `u0x0` (a valid token) rather than the bare
+    // `u0x` the parser rejects.
+    if words.iter().all(|&w| w == 0) {
+        return f.write_str("0");
+    }
     for word in words.iter().rev() {
         write!(f, "{word:016x}")?;
     }
@@ -1614,6 +1631,35 @@ pub(crate) fn fmt_function(
     f.write_str("}\n")
 }
 
+/// Print a struct body inline: `{ <elem>, ... }` (or `<{ ... }>` when
+/// packed). Mirrors the literal-struct arm of `Type`'s `Display`
+/// (`type.rs`), recursing into elements via `Type::new` — which renders a
+/// *named* element as `%Name` and any other type structurally.
+fn fmt_struct_body(
+    f: &mut fmt::Formatter<'_>,
+    body: &StructBody,
+    m: &Module<'_>,
+) -> fmt::Result {
+    if body.packed {
+        f.write_str("<{ ")?;
+    } else {
+        f.write_str("{ ")?;
+    }
+    let mut first = true;
+    for e in body.elements.iter() {
+        if !first {
+            f.write_str(", ")?;
+        }
+        first = false;
+        write!(f, "{}", Type::new(*e, m))?;
+    }
+    if body.packed {
+        f.write_str(" }>")
+    } else {
+        f.write_str(" }")
+    }
+}
+
 pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Result {
     writeln!(f, "; ModuleID = '{}'", m.name())?;
 
@@ -1659,6 +1705,36 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
         f.write_str("\n")?;
         for c in comdats_iter.by_ref() {
             fmt_comdat(f, c)?;
+        }
+    }
+
+    // Named-struct type identities. Mirrors the `printTypeIdentities`
+    // call in `AssemblyWriter::printModule`, emitted between comdats and
+    // globals: a leading blank line if any exist, then one
+    // `%Name = type {...}` (or `%Name = type opaque`) line per struct in
+    // declaration order.
+    {
+        let struct_ids = m.iter_named_struct_ids();
+        if !struct_ids.is_empty() {
+            f.write_str("\n")?;
+            for id in struct_ids {
+                let data = m.context().type_data(id);
+                let s = data
+                    .as_struct()
+                    .expect("iter_named_struct_ids yields only struct ids");
+                let name = s
+                    .name
+                    .as_ref()
+                    .expect("named struct must have a name");
+                write!(f, "%{name} = type ")?;
+                match s.body.borrow().as_ref() {
+                    Some(body) => fmt_struct_body(f, body, m)?,
+                    // KirpiIR never creates opaque structs, but be faithful
+                    // to LLVM, which prints those as `%Name = type opaque`.
+                    None => f.write_str("opaque")?,
+                }
+                f.write_str("\n")?;
+            }
         }
     }
 
