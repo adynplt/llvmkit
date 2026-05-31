@@ -96,3 +96,37 @@ fn post_construction_function_attributes() -> Result<(), IrError> {
     );
     Ok(())
 }
+
+/// `metadata_as_value` uniques by metadata node (mirrors LLVM's
+/// `MetadataAsValue::get`): wrapping the same node twice yields the
+/// identical `Value`, so value identity/equality stays meaningful and
+/// the use-list is not fragmented across duplicates.
+#[test]
+fn metadata_as_value_is_uniqued() {
+    let m = Module::new("u");
+    let s = m.metadata_string("rsp");
+    let node = m.metadata_tuple([MetadataRef(s)]);
+    let a = m.metadata_as_value(node);
+    let b = m.metadata_as_value(node);
+    assert_eq!(a, b, "same metadata node must yield the same Value");
+}
+
+/// A string referenced by both a tuple and a named-metadata node must not
+/// produce a dangling `!N`: named-metadata operands require a numbered
+/// reference (clang rejects an inline `!"..."` there), so the string stays
+/// a standalone node that every reference can resolve. Regression test for
+/// the inlining/skip interaction.
+#[test]
+fn string_referenced_by_named_metadata_is_not_dangling() {
+    let m = Module::new("d");
+    let s = m.metadata_string("x");
+    let _tuple = m.metadata_tuple([MetadataRef(s)]); // !{!0}
+    let idx = m.get_or_insert_named_metadata("my.named");
+    m.named_metadata_add_operand(idx, MetadataRef(s)); // !{!0}
+
+    let text = format!("{m}");
+    // The string is referenced by name, so it must be emitted standalone…
+    assert!(text.contains(r#"!0 = !"x""#), "output:\n{text}");
+    // …and both references resolve to that node (no inlining → no dangling).
+    assert!(text.contains("!my.named = !{!0}"), "output:\n{text}");
+}

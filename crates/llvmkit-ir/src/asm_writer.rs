@@ -22,7 +22,7 @@
 //! arm at a time as their builders land.
 
 use core::fmt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::AttrIndex;
 use crate::attributes::{AttributeStorage, AttributeStored};
@@ -1766,6 +1766,20 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
         fmt_function(f, func)?;
     }
 
+    // Collect the metadata ids referenced directly by named metadata.
+    // Named-metadata operands must be numbered `!N` references — clang
+    // rejects an inline `!"..."` there — so any MDString reachable this
+    // way must stay a standalone numbered node and is never inlined.
+    let named_md_refs: HashSet<usize> = {
+        let mut set = HashSet::new();
+        for node in m.named_metadata_list().iter() {
+            for op in node.operands() {
+                set.insert(op.0.index());
+            }
+        }
+        set
+    };
+
     // Numbered metadata nodes. Mirrors the
     // `for (const auto &[Slot, Node] : ...NumberedMetadata())`
     // loop in `printModule`. Emitted as `!N = !{...}` or `!N = !""`.
@@ -1773,13 +1787,12 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
         let md = m.metadata_store();
         let nodes = md.nodes();
         if !nodes.is_empty() {
-            // `MDString`s referenced from a tuple are printed inline in
-            // that tuple's body, never as standalone `!N = !"..."` nodes
-            // (which `clang` rejects). Skip them in the numbered listing.
-            let inlined = inlined_string_ids(nodes);
+            // MDStrings inlined into a tuple body are not emitted as
+            // standalone `!N = !"..."` nodes (which clang rejects).
+            let inlinable = inlinable_string_ids(nodes, &named_md_refs);
             let mut wrote_header = false;
             for (i, node) in nodes.iter().enumerate() {
-                if inlined.contains(&i) {
+                if inlinable[i] {
                     continue;
                 }
                 if !wrote_header {
@@ -1787,7 +1800,7 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
                     wrote_header = true;
                 }
                 write!(f, "!{i} = ")?;
-                fmt_metadata_node(f, node, &md)?;
+                fmt_metadata_node(f, node, &md, &inlinable)?;
                 f.write_str("\n")?;
             }
         }
@@ -1814,10 +1827,18 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
     Ok(())
 }
 
+/// Print an `MDString` body: `!"..."`. Shared by the standalone-node and
+/// inline-operand paths.
+fn fmt_md_string(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
+    f.write_str("!\"")?;
+    print_escaped_string(f, s.as_bytes())?;
+    f.write_str("\"")
+}
+
 /// Print one metadata node body. Mirrors `WriteMDNodeBodyInternal` in
 /// `lib/IR/AsmWriter.cpp`.
 ///
-/// Tuple operands that resolve to an `MDString` are printed *inline*
+/// Tuple operands flagged in `inlinable` are printed *inline*
 /// (`!{!"rsp"}`) rather than as a numbered reference. LLVM never numbers
 /// `MDString`s as standalone nodes — a top-level `!N = !"..."` is rejected
 /// by `clang`/`llvm-as` — so inlining keeps the emitted module parseable.
@@ -1825,21 +1846,18 @@ fn fmt_metadata_node(
     f: &mut fmt::Formatter<'_>,
     node: &crate::metadata::MetadataKind,
     store: &crate::metadata::MetadataStore,
+    inlinable: &[bool],
 ) -> fmt::Result {
     use crate::metadata::MetadataKind;
     match node {
-        MetadataKind::String(s) => {
-            f.write_str("!\"")?;
-            print_escaped_string(f, s.as_bytes())?;
-            f.write_str("\"")
-        }
+        MetadataKind::String(s) => fmt_md_string(f, s),
         MetadataKind::Tuple(operands) => {
             f.write_str("!{")?;
             for (i, op) in operands.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                fmt_metadata_operand(f, op.0, store)?;
+                fmt_metadata_operand(f, op.0, store, inlinable)?;
             }
             f.write_str("}")
         }
@@ -1849,41 +1867,49 @@ fn fmt_metadata_node(
     }
 }
 
-/// Print a single metadata operand. An `MDString` operand is inlined as
-/// `!"..."`; anything else is a numbered reference `!N`.
+/// Print a single metadata operand. An `MDString` operand flagged
+/// `inlinable` is printed inline as `!"..."`; anything else is a numbered
+/// reference `!N`.
 fn fmt_metadata_operand(
     f: &mut fmt::Formatter<'_>,
     id: crate::metadata::MetadataId,
     store: &crate::metadata::MetadataStore,
+    inlinable: &[bool],
 ) -> fmt::Result {
-    match store.get(id) {
-        Some(crate::metadata::MetadataKind::String(s)) => {
-            f.write_str("!\"")?;
-            print_escaped_string(f, s.as_bytes())?;
-            f.write_str("\"")
+    if inlinable.get(id.index()).copied().unwrap_or(false) {
+        if let Some(crate::metadata::MetadataKind::String(s)) = store.get(id) {
+            return fmt_md_string(f, s);
         }
-        _ => write!(f, "!{}", id.index()),
     }
+    write!(f, "!{}", id.index())
 }
 
-/// Collect the ids of every `MDString` node that is referenced as a tuple
-/// operand. Such strings are emitted *inline* in the tuple body, so they
-/// must be skipped in the top-level numbered-node listing (a standalone
-/// `!N = !"..."` is not valid LLVM textual IR).
-fn inlined_string_ids(nodes: &[crate::metadata::MetadataKind]) -> std::collections::HashSet<usize> {
+/// Flag every `MDString` node that may be inlined into its referencing
+/// tuple body (and therefore omitted from the top-level numbered listing).
+/// A string is inlinable iff it is referenced by at least one tuple
+/// operand AND is not referenced by any named-metadata operand — the
+/// latter require a numbered `!N` reference, so such a string must remain
+/// a standalone node to keep every reference resolvable. Indexed by
+/// `MetadataId::index()`.
+fn inlinable_string_ids(
+    nodes: &[crate::metadata::MetadataKind],
+    named_md_refs: &HashSet<usize>,
+) -> Vec<bool> {
     use crate::metadata::MetadataKind;
-    let mut set = std::collections::HashSet::new();
+    let mut inlinable = vec![false; nodes.len()];
     for node in nodes {
         if let MetadataKind::Tuple(operands) = node {
             for op in operands {
                 let idx = op.0.index();
-                if matches!(nodes.get(idx), Some(MetadataKind::String(_))) {
-                    set.insert(idx);
+                if !named_md_refs.contains(&idx)
+                    && matches!(nodes.get(idx), Some(MetadataKind::String(_)))
+                {
+                    inlinable[idx] = true;
                 }
             }
         }
     }
-    set
+    inlinable
 }
 
 fn fmt_comdat(f: &mut fmt::Formatter<'_>, c: crate::comdat::ComdatRef<'_>) -> fmt::Result {
