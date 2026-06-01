@@ -507,6 +507,21 @@ impl Context {
         })
     }
 
+    pub(crate) fn intern_constant_symbol_delta(
+        &self,
+        ty: TypeId,
+        hi_id: ValueId,
+        lo_id: ValueId,
+    ) -> ValueId {
+        self.push_value(ValueData {
+            ty,
+            name: core::cell::RefCell::new(None),
+            debug_loc: None,
+            kind: ValueKindData::Constant(ConstantData::SymbolDelta { hi_id, lo_id }),
+            use_list: core::cell::RefCell::new(Vec::new()),
+        })
+    }
+
     pub(crate) fn intern_constant_aggregate(
         &self,
         ty: TypeId,

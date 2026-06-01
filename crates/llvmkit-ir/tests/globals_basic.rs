@@ -657,6 +657,42 @@ fn const_vector_initializer() {
 }
 
 // ---------------------------------------------------------------------------
+// Symbol-difference ConstantExpr (the link-time `sub(ptrtoint, ptrtoint)` form)
+// ---------------------------------------------------------------------------
+
+/// Mirrors `test/Bitcode/compatibility.ll` constant-expression coverage for
+/// `sub (i64 ptrtoint (ptr @a to i64), i64 ptrtoint (ptr @b to i64))`: the
+/// two-symbol difference materialised by `GlobalVariable::delta_from`, used as
+/// a global initializer so the linker computes the delta. Asserts the exact
+/// const-expr serialization.
+#[test]
+fn symbol_delta_constexpr_initializer() {
+    let m = Module::new("m");
+    let i8_ty = m.i8_type();
+    let i64_ty = m.i64_type();
+    let zero8 = i8_ty.const_int(0i8);
+    // Two real defined symbols: a "real" target and an "anchor".
+    let real = m
+        .add_global_constant("real", i8_ty.as_type(), zero8)
+        .expect("real");
+    let anchor = m
+        .add_global_constant("anchor", i8_ty.as_type(), zero8)
+        .expect("anchor");
+    // @delta = constant i64 sub(ptrtoint(@real), ptrtoint(@anchor)).
+    let delta = real.delta_from(anchor);
+    m.add_global_constant("delta", i64_ty.as_type(), delta)
+        .expect("delta");
+    let text = module_text(&m);
+    assert!(
+        text.contains(
+            "@delta = constant i64 sub (i64 ptrtoint (ptr @real to i64), \
+             i64 ptrtoint (ptr @anchor to i64))\n"
+        ),
+        "got:\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Verifier negatives
 // ---------------------------------------------------------------------------
 

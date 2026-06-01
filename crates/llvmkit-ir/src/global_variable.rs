@@ -138,6 +138,32 @@ impl<'ctx> GlobalVariable<'ctx> {
         }
     }
 
+    /// An `i64` constant equal to `self_addr - other_addr`, printed as the
+    /// const-expr `sub (i64 ptrtoint (ptr @self to i64), i64 ptrtoint (ptr
+    /// @other to i64))`.
+    ///
+    /// llvmkit has no general `ConstantExpr`; this materialises the one
+    /// two-symbol difference form needed to bake a link-time delta into a
+    /// global initializer. lld resolves the subtraction at link time, so the
+    /// delta is a real constant in the image without either absolute address
+    /// being known at emit time. Use it to express an address as
+    /// `anchor + (real - anchor)` while keeping `real` out of the code stream:
+    /// store `real.delta_from(anchor)` in a data global and add it to
+    /// `ptrtoint @anchor` at the use site. Both globals must be defined symbols
+    /// in the final image.
+    pub fn delta_from(self, other: GlobalVariable<'ctx>) -> Constant<'ctx> {
+        let module = self.module.module();
+        let i64_ty = module.i64_type().as_type().id();
+        let id = module
+            .context()
+            .intern_constant_symbol_delta(i64_ty, self.id, other.id);
+        Constant {
+            id,
+            module: self.module,
+            ty: i64_ty,
+        }
+    }
+
     fn data(self) -> &'ctx GlobalVariableData {
         match &self.module.value_data(self.id).kind {
             ValueKindData::GlobalVariable(g) => g,

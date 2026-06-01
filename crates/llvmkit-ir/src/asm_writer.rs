@@ -254,6 +254,20 @@ pub(crate) fn fmt_constant(
             fmt_operand_ref(f, base, None)?;
             write!(f, ", i64 {off})")
         }
+        ConstantData::SymbolDelta { hi_id, lo_id } => {
+            // `sub (i64 ptrtoint (ptr @hi to i64), i64 ptrtoint (ptr @lo to i64))`
+            // — the link-time symbol-difference ConstantExpr. Each operand
+            // prints by name (a global or function); lld folds the subtraction
+            // into a single i64 relocation.
+            let module = host.module.module();
+            let hi = Value::from_parts(*hi_id, module, module.context().value_data(*hi_id).ty);
+            let lo = Value::from_parts(*lo_id, module, module.context().value_data(*lo_id).ty);
+            f.write_str("sub (i64 ptrtoint (ptr ")?;
+            fmt_operand_ref(f, hi, None)?;
+            f.write_str(" to i64), i64 ptrtoint (ptr ")?;
+            fmt_operand_ref(f, lo, None)?;
+            f.write_str(" to i64))")
+        }
     }
 }
 

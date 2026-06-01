@@ -68,6 +68,17 @@ pub(crate) enum ConstantData {
     /// global (e.g. a relocated pointer slot inside an embedded section). The
     /// owning value's type is `ptr`.
     GepOffset { base_id: ValueId, off: i64 },
+    /// Link-time difference of two symbol addresses, printed as the constant
+    /// expression `sub (i64 ptrtoint (ptr @hi to i64), i64 ptrtoint (ptr @lo to
+    /// i64))`. Both ids are globals/functions; the owning value's type is `i64`.
+    /// The subtraction is resolved by the linker (a section-relative
+    /// relocation), so neither operand's absolute address need be known at
+    /// emit time. This is the second `ConstantExpr` form llvmkit materialises —
+    /// added for symbol-relative obfuscation, where a real address is reached as
+    /// `anchor + (real - anchor)` and only the delta lives in data. The two ids
+    /// must differ (a self-delta would be a constant zero; callers should use
+    /// `Int(0)` for that).
+    SymbolDelta { hi_id: ValueId, lo_id: ValueId },
     /// `undef` of any first-class type.
     Undef,
     /// `poison` of any first-class type. Distinct from `undef` per
