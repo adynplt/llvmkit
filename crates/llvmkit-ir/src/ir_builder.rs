@@ -892,6 +892,139 @@ where
         Ok(IntValue::<W>::from_value_unchecked(inst.as_value()))
     }
 
+    // ---- Type-erased integer binops (scalar OR integer-vector operands) ----
+    //
+    // The typed `build_int_*` family routes both operands through
+    // `IntoIntValue<W>`, whose `TryFrom<Value>` impls accept only scalar
+    // `iN` types and reject integer *vectors* (`<N x iM>`). Element-wise
+    // vector arithmetic (`xor <2 x i64> ...`) is legal IR the verifier
+    // already accepts (`is_int_or_int_vector`), but there was no builder
+    // path to emit it. These `_dyn` wrappers take erased [`Value`] operands
+    // and skip the scalar-only `IntoIntValue` conversion, mirroring the
+    // untyped cast builder [`build_bitcast_dyn`]. The result type is the
+    // LHS operand's type; the caller is responsible for operand-type
+    // agreement (the LLVM verifier rejects ill-formed binops).
+
+    /// Crate-internal: emit an integer binop on erased [`Value`] operands
+    /// (scalar `iN` or integer vector `<N x iM>`), the result taking the LHS
+    /// operand's type. Skips the scalar-only `IntoIntValue` conversion the
+    /// typed `build_int_*` family performs, so it accepts vector operands.
+    fn build_int_binop_dyn<F2>(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+        kind_ctor: F2,
+    ) -> IrResult<crate::value::Value<'ctx>>
+    where
+        F2: FnOnce(BinaryOpData) -> InstructionKindData,
+    {
+        self.require_same_module(lhs)?;
+        self.require_same_module(rhs)?;
+        let payload = BinaryOpData::new(lhs.id, rhs.id);
+        let inst = self.append_instruction(lhs.ty().id(), kind_ctor(payload), name);
+        Ok(inst.as_value())
+    }
+
+    /// `add lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_add_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::Add)
+    }
+
+    /// `sub lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_sub_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::Sub)
+    }
+
+    /// `mul lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_mul_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::Mul)
+    }
+
+    /// `xor lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_xor_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::Xor)
+    }
+
+    /// `and lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_and_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::And)
+    }
+
+    /// `or lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_or_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::Or)
+    }
+
+    /// `shl lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_shl_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::Shl)
+    }
+
+    /// `lshr lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_lshr_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::LShr)
+    }
+
+    /// `ashr lhs, rhs` on erased operands (scalar or integer vector).
+    /// See [`build_int_binop_dyn`](Self::build_int_binop_dyn).
+    pub fn build_int_ashr_dyn(
+        &self,
+        lhs: crate::value::Value<'ctx>,
+        rhs: crate::value::Value<'ctx>,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::value::Value<'ctx>> {
+        self.build_int_binop_dyn(lhs, rhs, name, InstructionKindData::AShr)
+    }
+
     // ---- Floating-point arithmetic ----
 
     /// Produce `fadd lhs, rhs`. Mirrors `IRBuilder::CreateFAdd`.
