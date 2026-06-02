@@ -40,6 +40,7 @@ pub mod function;
 pub mod gep_no_wrap_flags;
 pub mod global_value;
 pub mod global_variable;
+pub mod inline_asm;
 pub mod instr_types;
 pub mod instruction;
 pub mod instructions;
@@ -107,6 +108,7 @@ pub use gep_no_wrap_flags::GepNoWrapFlags;
 pub use global_value::Linkage;
 pub use global_value::{DllStorageClass, ThreadLocalMode, Visibility};
 pub use global_variable::{GlobalBuilder, GlobalVariable};
+pub use inline_asm::{AsmDialect, InlineAsm};
 pub use instr_types::{
     AShrFlags, AddFlags, AtomicCmpXchgConfig, AtomicLoadConfig, AtomicRMWConfig, AtomicRMWFlags,
     AtomicStoreConfig, CmpXchgFlags, ICmpFlags, LShrFlags, MulFlags, OrFlags, SDivFlags, ShlFlags,

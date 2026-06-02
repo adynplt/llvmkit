@@ -224,7 +224,41 @@ pub(crate) fn fmt_operand_ref(
         // `fmt_call` printing `{ty} {ref}`. Mirrors AsmWriter's
         // `writeOperand` for a `MetadataAsValue` operand.
         ValueKindData::MetadataAsValue(id) => write!(f, "!{}", id.index()),
+        // An inline-asm value only ever appears as a `call` callee, where
+        // `fmt_call` short-circuits to the `asm "...", "..."` form before
+        // reaching here. If one is reached as a bare operand (it should
+        // not be), print the `asm` body so the output is still
+        // self-describing rather than panicking.
+        ValueKindData::InlineAsm(d) => fmt_inline_asm(f, d),
     }
+}
+
+/// Print the `asm`-callee body shared by `fmt_operand_ref` and
+/// `fmt_call`:
+/// `asm [sideeffect ][alignstack ][inteldialect ]"<asm>", "<constraints>"`.
+/// The leading `asm` token and the keyword set mirror
+/// `AssemblyWriter::writeOperand`'s `InlineAsm` arm in
+/// `lib/IR/AsmWriter.cpp`; the strings are escaped exactly like a
+/// `module asm` line (see [`print_escaped_string`]).
+fn fmt_inline_asm(
+    f: &mut fmt::Formatter<'_>,
+    d: &crate::inline_asm::InlineAsmData,
+) -> fmt::Result {
+    f.write_str("asm ")?;
+    if d.has_side_effects {
+        f.write_str("sideeffect ")?;
+    }
+    if d.is_align_stack {
+        f.write_str("alignstack ")?;
+    }
+    if matches!(d.dialect, crate::inline_asm::AsmDialect::Intel) {
+        f.write_str("inteldialect ")?;
+    }
+    f.write_str("\"")?;
+    print_escaped_string(f, d.asm_string.as_bytes())?;
+    f.write_str("\", \"")?;
+    print_escaped_string(f, d.constraint_string.as_bytes())?;
+    f.write_str("\"")
 }
 
 // --------------------------------------------------------------------------
@@ -1101,11 +1135,23 @@ fn fmt_call(
     }
     let module = inst.module();
     // Print the return type. Mirrors AsmWriter's
-    // `printType(I.getType())`.
+    // `printType(I.getType())`. This is the *call result* type
+    // (`inst.ty()`), not the callee's pointer type — important for the
+    // inline-asm case, where the callee value is `ptr`-typed but the call
+    // yields the asm's wrapped return type.
     write!(f, "{} ", inst.ty())?;
     let cd = module.context().value_data(c.callee.get());
-    let callee = Value::from_parts(c.callee.get(), module, cd.ty);
-    fmt_operand_ref(f, callee, Some(slots))?;
+    // An inline-asm callee prints the `asm "...", "..."` form in place of
+    // an `@name` / SSA operand. Mirrors `AssemblyWriter`'s `CallInst`
+    // path, which routes an `InlineAsm` callee through `writeOperand`'s
+    // `asm` printer rather than emitting a symbolic callee.
+    match &cd.kind {
+        ValueKindData::InlineAsm(d) => fmt_inline_asm(f, d)?,
+        _ => {
+            let callee = Value::from_parts(c.callee.get(), module, cd.ty);
+            fmt_operand_ref(f, callee, Some(slots))?;
+        }
+    }
     f.write_str("(")?;
     let mut first = true;
     for arg_cell in c.args.iter() {

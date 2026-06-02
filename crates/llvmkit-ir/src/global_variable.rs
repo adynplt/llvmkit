@@ -498,6 +498,7 @@ impl<'ctx> TryFrom<Value<'ctx>> for GlobalVariable<'ctx> {
                     ValueKindData::Instruction(_) => ValueCategoryLabel::Instruction,
                     ValueKindData::GlobalVariable(_) => ValueCategoryLabel::GlobalVariable,
                     ValueKindData::MetadataAsValue(_) => ValueCategoryLabel::MetadataAsValue,
+                    ValueKindData::InlineAsm(_) => ValueCategoryLabel::InlineAsm,
                 };
                 Err(IrError::ValueCategoryMismatch {
                     expected: ValueCategoryLabel::GlobalVariable,

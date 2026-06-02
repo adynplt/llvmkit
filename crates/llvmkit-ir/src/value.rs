@@ -130,6 +130,13 @@ pub(crate) enum ValueKindData {
     /// it is context-global — it has no function-local SSA definition
     /// and is never assigned a `%N` slot.
     MetadataAsValue(crate::metadata::MetadataId),
+    /// An inline-assembly value used as a `call` callee. Mirrors LLVM's
+    /// `InlineAsm` (`llvm/include/llvm/IR/InlineAsm.h`). Like a
+    /// `Function` or `Constant`, it is context-global — it has no
+    /// function-local SSA definition and is never assigned a `%N` slot;
+    /// a `call` whose callee is one of these prints the `asm ...` form
+    /// instead of an `@name` operand.
+    InlineAsm(crate::inline_asm::InlineAsmData),
 }
 
 // --------------------------------------------------------------------------
@@ -213,6 +220,7 @@ impl<'ctx> Value<'ctx> {
             ValueKindData::Instruction(_) => ValueCategory::Instruction,
             ValueKindData::GlobalVariable(_) => ValueCategory::GlobalVariable,
             ValueKindData::MetadataAsValue(_) => ValueCategory::MetadataAsValue,
+            ValueKindData::InlineAsm(_) => ValueCategory::InlineAsm,
         }
     }
 
@@ -259,6 +267,7 @@ pub enum ValueCategory {
     Instruction,
     GlobalVariable,
     MetadataAsValue,
+    InlineAsm,
 }
 
 impl From<ValueCategory> for crate::error::ValueCategoryLabel {
@@ -271,6 +280,7 @@ impl From<ValueCategory> for crate::error::ValueCategoryLabel {
             ValueCategory::Instruction => Self::Instruction,
             ValueCategory::GlobalVariable => Self::GlobalVariable,
             ValueCategory::MetadataAsValue => Self::MetadataAsValue,
+            ValueCategory::InlineAsm => Self::InlineAsm,
         }
     }
 }

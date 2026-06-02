@@ -82,6 +82,7 @@ pub enum ValueCategoryLabel {
     Instruction,
     GlobalVariable,
     MetadataAsValue,
+    InlineAsm,
 }
 
 impl fmt::Display for ValueCategoryLabel {
@@ -94,6 +95,7 @@ impl fmt::Display for ValueCategoryLabel {
             ValueCategoryLabel::Instruction => "instruction",
             ValueCategoryLabel::GlobalVariable => "global-variable",
             ValueCategoryLabel::MetadataAsValue => "metadata-as-value",
+            ValueCategoryLabel::InlineAsm => "inline-asm",
         };
         f.write_str(s)
     }

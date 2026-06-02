@@ -933,6 +933,56 @@ impl<'ctx> Module<'ctx> {
         buf.push_str(line.as_ref());
     }
 
+    /// Create an inline-assembly value usable as a `call` callee. Mirrors
+    /// `InlineAsm::get` in `llvm/include/llvm/IR/InlineAsm.h`.
+    ///
+    /// `fn_ty` is the conceptual function type the asm wraps — it governs
+    /// the return type and argument types of any `call` through this
+    /// value. `asm` is the assembly template (e.g. `"add $1, $0"`), and
+    /// `constraints` is the constraint string (e.g. `"=r,r,r"`). The
+    /// boolean flags map to the `sideeffect` / `alignstack` keywords, and
+    /// `dialect` selects AT&T (default) or Intel syntax (the latter prints
+    /// the `inteldialect` keyword).
+    ///
+    /// The returned [`InlineAsm`](crate::inline_asm::InlineAsm) value's
+    /// [`ty`](crate::value::Value::ty) is the module's `ptr` type — LLVM
+    /// types inline asm as a pointer — while the wrapped function type is
+    /// recovered via
+    /// [`InlineAsm::function_type`](crate::inline_asm::InlineAsm::function_type).
+    /// It is context-global: it carries no function-local SSA definition,
+    /// is never assigned a `%N` slot, and is not registered in the
+    /// function-by-name table. Pass it to
+    /// [`build_inline_asm_call`](crate::ir_builder::IRBuilder::build_inline_asm_call).
+    pub fn inline_asm(
+        &'ctx self,
+        fn_ty: FunctionType<'ctx>,
+        asm: impl Into<String>,
+        constraints: impl Into<String>,
+        has_side_effects: bool,
+        is_align_stack: bool,
+        dialect: crate::inline_asm::AsmDialect,
+    ) -> crate::inline_asm::InlineAsm<'ctx> {
+        // LLVM types inline asm as a plain pointer; the function type the
+        // asm wraps is carried in the payload for the call to consume.
+        let ptr_ty = self.ptr_type(0).as_type().id();
+        let data = crate::inline_asm::InlineAsmData {
+            asm_string: asm.into(),
+            constraint_string: constraints.into(),
+            fn_ty: fn_ty.as_type().id(),
+            has_side_effects,
+            is_align_stack,
+            dialect,
+        };
+        let id = self.ctx.push_value(crate::value::ValueData {
+            ty: ptr_ty,
+            name: core::cell::RefCell::new(None),
+            debug_loc: None,
+            kind: crate::value::ValueKindData::InlineAsm(data),
+            use_list: core::cell::RefCell::new(Vec::new()),
+        });
+        crate::inline_asm::InlineAsm::from_parts(id, self, ptr_ty)
+    }
+
     // ---- Metadata ----
 
     /// Intern a metadata string node. Returns an existing id if an

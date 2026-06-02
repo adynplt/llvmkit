@@ -2784,6 +2784,69 @@ where
         ))
     }
 
+    /// Produce a `call` whose callee is an inline-assembly value. Mirrors
+    /// `IRBuilder::CreateCall(InlineAsm*, args)` — the asm carries its own
+    /// function type, so the call's return / argument shape comes from
+    /// [`InlineAsm::function_type`](crate::inline_asm::InlineAsm). The
+    /// result prints as the `asm` form, e.g.
+    /// `call i64 asm sideeffect "...", "=r,r,r"(i64 %a, i64 %b)`, instead
+    /// of an `@name` operand.
+    ///
+    /// The caller picks the return marker `R2` to match the asm's wrapped
+    /// return type; a mismatch fails with
+    /// [`IrError::ReturnTypeMismatch`]. The calling convention is `C`,
+    /// matching what LLVM emits for an inline-asm call.
+    pub fn build_inline_asm_call<R2, I, V>(
+        &self,
+        asm: crate::inline_asm::InlineAsm<'ctx>,
+        args: I,
+        name: impl AsRef<str>,
+    ) -> IrResult<crate::instructions::CallInst<'ctx, R2>>
+    where
+        R2: crate::marker::ReturnMarker,
+        I: IntoIterator<Item = V>,
+        V: crate::value::IsValue<'ctx>,
+    {
+        let asm_v = asm.as_value();
+        self.require_same_module(asm_v)?;
+        let fn_ty = asm.function_type();
+        // Reject a return-marker / signature mismatch up front, mirroring
+        // `Module::add_function`'s `signature_matches_marker` gate.
+        let ret_data = self
+            .module
+            .context()
+            .type_data(fn_ty.return_type().id());
+        if !crate::function::signature_matches_marker::<R2>(ret_data) {
+            return Err(IrError::ReturnTypeMismatch {
+                expected: fn_ty.return_type().kind_label(),
+                got: fn_ty.return_type().kind_label(),
+            });
+        }
+        let mut arg_ids: Vec<crate::value::ValueId> = Vec::new();
+        for arg in args {
+            let v = arg.as_value();
+            self.require_same_module(v)?;
+            arg_ids.push(v.id);
+        }
+        let payload = crate::instr_types::CallInstData::new(
+            asm_v.id,
+            fn_ty.as_type().id(),
+            arg_ids.into_boxed_slice(),
+            crate::CallingConv::C,
+            crate::instr_types::TailCallKind::None,
+        );
+        let inst = self.append_instruction(
+            fn_ty.return_type().id(),
+            InstructionKindData::Call(payload),
+            name,
+        );
+        Ok(crate::instructions::CallInst::<R2>::from_raw(
+            inst.as_value().id,
+            inst.module(),
+            inst.ty().id(),
+        ))
+    }
+
     // ---- GEP ----
 
     /// Produce `getelementptr <source-ty>, ptr <ptr>, <indices>`.
