@@ -692,6 +692,42 @@ fn symbol_delta_constexpr_initializer() {
     );
 }
 
+/// `GlobalVariable::delta_from_plus` materialises the symbol difference with a
+/// constant addend, `add (i64 sub (i64 ptrtoint(@real), i64 ptrtoint(@anchor)),
+/// i64 K)` — the encrypted-delta form. Asserts the exact const-expr.
+#[test]
+fn symbol_delta_plus_constexpr_initializer() {
+    let m = Module::new("m");
+    let i8_ty = m.i8_type();
+    let i64_ty = m.i64_type();
+    let zero8 = i8_ty.const_int(0i8);
+    let real = m
+        .add_global_constant("real", i8_ty.as_type(), zero8)
+        .expect("real");
+    let anchor = m
+        .add_global_constant("anchor", i8_ty.as_type(), zero8)
+        .expect("anchor");
+    // @enc = constant i64 (sub(ptrtoint(@real), ptrtoint(@anchor)) + 12345).
+    let enc = real.delta_from_plus(anchor, 12345);
+    m.add_global_constant("enc", i64_ty.as_type(), enc)
+        .expect("enc");
+    let text = module_text(&m);
+    assert!(
+        text.contains(
+            "@enc = constant i64 add (i64 sub (i64 ptrtoint (ptr @real to i64), \
+             i64 ptrtoint (ptr @anchor to i64)), i64 12345)\n"
+        ),
+        "got:\n{text}"
+    );
+
+    // A negative addend prints with a leading minus.
+    let enc2 = real.delta_from_plus(anchor, -7);
+    m.add_global_constant("enc2", i64_ty.as_type(), enc2)
+        .expect("enc2");
+    let text2 = module_text(&m);
+    assert!(text2.contains(", i64 -7)\n"), "got:\n{text2}");
+}
+
 // ---------------------------------------------------------------------------
 // Verifier negatives
 // ---------------------------------------------------------------------------

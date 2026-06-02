@@ -164,6 +164,30 @@ impl<'ctx> GlobalVariable<'ctx> {
         }
     }
 
+    /// An `i64` constant equal to `(self_addr - other_addr) + addend`, printed
+    /// as `add (i64 sub (i64 ptrtoint (ptr @self to i64), i64 ptrtoint (ptr
+    /// @other to i64)), i64 addend)`.
+    ///
+    /// Like [`Self::delta_from`] but with a baked-in constant `addend` the
+    /// linker folds into the same additive relocation. Use it to store an
+    /// *encrypted* delta `(real - anchor) + K` in a data global so the runtime
+    /// recovers `real` as `anchor + (enc - K)` — a genuine subtraction the
+    /// optimizer cannot fold to a passthrough (unlike a bare delta wrapped in
+    /// identity arithmetic). Both globals must be defined symbols in the final
+    /// image.
+    pub fn delta_from_plus(self, other: GlobalVariable<'ctx>, addend: i64) -> Constant<'ctx> {
+        let module = self.module.module();
+        let i64_ty = module.i64_type().as_type().id();
+        let id = module
+            .context()
+            .intern_constant_symbol_delta_plus(i64_ty, self.id, other.id, addend);
+        Constant {
+            id,
+            module: self.module,
+            ty: i64_ty,
+        }
+    }
+
     fn data(self) -> &'ctx GlobalVariableData {
         match &self.module.value_data(self.id).kind {
             ValueKindData::GlobalVariable(g) => g,

@@ -79,6 +79,16 @@ pub(crate) enum ConstantData {
     /// must differ (a self-delta would be a constant zero; callers should use
     /// `Int(0)` for that).
     SymbolDelta { hi_id: ValueId, lo_id: ValueId },
+    /// Link-time symbol difference plus a constant addend, printed as
+    /// `add (i64 sub (i64 ptrtoint (ptr @hi to i64), i64 ptrtoint (ptr @lo to
+    /// i64)), i64 <addend>)`. Like [`ConstantData::SymbolDelta`] but with a
+    /// baked-in integer `addend` the linker folds into the same relocation
+    /// (additive relocations compose). Used to bake an *encrypted* delta —
+    /// `(real - anchor) + K` — so the recovered value is `enc - K` rather than
+    /// the bare delta, giving the runtime decrypt a genuine (non-identity)
+    /// computation the optimizer cannot fold away. The two symbol ids must
+    /// differ; the owning value's type is `i64`.
+    SymbolDeltaPlus { hi_id: ValueId, lo_id: ValueId, addend: i64 },
     /// `undef` of any first-class type.
     Undef,
     /// `poison` of any first-class type. Distinct from `undef` per

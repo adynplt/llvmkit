@@ -268,6 +268,22 @@ pub(crate) fn fmt_constant(
             fmt_operand_ref(f, lo, None)?;
             f.write_str(" to i64))")
         }
+        ConstantData::SymbolDeltaPlus { hi_id, lo_id, addend } => {
+            // `add (i64 sub (i64 ptrtoint (ptr @hi to i64), i64 ptrtoint (ptr @lo
+            // to i64)), i64 <addend>)` — the symbol difference with a constant
+            // addend. lld folds the whole nested add/sub into one additive i64
+            // relocation, so the encrypted delta `(real - anchor) + addend` is a
+            // real constant in the image without either absolute address known
+            // at emit time.
+            let module = host.module.module();
+            let hi = Value::from_parts(*hi_id, module, module.context().value_data(*hi_id).ty);
+            let lo = Value::from_parts(*lo_id, module, module.context().value_data(*lo_id).ty);
+            f.write_str("add (i64 sub (i64 ptrtoint (ptr ")?;
+            fmt_operand_ref(f, hi, None)?;
+            f.write_str(" to i64), i64 ptrtoint (ptr ")?;
+            fmt_operand_ref(f, lo, None)?;
+            write!(f, " to i64)), i64 {addend})")
+        }
     }
 }
 
