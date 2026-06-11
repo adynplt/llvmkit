@@ -38,9 +38,9 @@ use crate::error::{IrError, IrResult, TypeKindLabel};
 use crate::float_kind::{BFloat, Fp128, Half, PpcFp128, X86Fp80};
 use crate::int_width::IntDyn;
 use crate::llvm_context::Context;
+use crate::named_md_node::NamedMDNode;
 use crate::r#type::{MAX_INT_BITS, MIN_INT_BITS, StructBody, Type, TypeId};
 use crate::typed_pointer_type::TypedPointerType;
-use crate::named_md_node::NamedMDNode;
 
 // --------------------------------------------------------------------------
 // ModuleId
@@ -185,8 +185,9 @@ pub struct Module<'ctx> {
     /// maps a metadata node to its wrapping value so repeated wraps of the
     /// same node return the identical `Value`. Mirrors LLVM's uniqued
     /// `MetadataAsValue::get`.
-    metadata_as_value_cache:
-        core::cell::RefCell<std::collections::HashMap<crate::metadata::MetadataId, crate::value::ValueId>>,
+    metadata_as_value_cache: core::cell::RefCell<
+        std::collections::HashMap<crate::metadata::MetadataId, crate::value::ValueId>,
+    >,
     /// Brand carrier. Without it, `Module<'ctx>` would have no use of
     /// `'ctx` in its fields (since `Context` is lifetime-free) and the
     /// parameter would be unconstrained.
@@ -1000,7 +1001,9 @@ impl<'ctx> Module<'ctx> {
         &self,
         operands: impl AsRef<[crate::metadata::MetadataRef]>,
     ) -> crate::metadata::MetadataId {
-        self.metadata.borrow_mut().get_tuple(operands.as_ref().to_vec())
+        self.metadata
+            .borrow_mut()
+            .get_tuple(operands.as_ref().to_vec())
     }
 
     /// Wrap a metadata node as a [`Value`](crate::value::Value) so it can
@@ -1014,7 +1017,10 @@ impl<'ctx> Module<'ctx> {
     /// [`build_call`](crate::ir_builder::IRBuilder::build_call). It is
     /// context-global: it carries no function-local SSA definition and is
     /// never assigned a `%N` slot; it prints as the bare `!N` reference.
-    pub fn metadata_as_value(&'ctx self, md: crate::metadata::MetadataId) -> crate::value::Value<'ctx> {
+    pub fn metadata_as_value(
+        &'ctx self,
+        md: crate::metadata::MetadataId,
+    ) -> crate::value::Value<'ctx> {
         let ty = self.ctx.metadata();
         // Unique by metadata node, mirroring `MetadataAsValue::get`: the
         // same node always yields the identical `Value` (one arena entry,
@@ -1043,7 +1049,11 @@ impl<'ctx> Module<'ctx> {
 
     /// Overwrite a reserved metadata node with concrete content. Pairs
     /// with [`metadata_reserve`](Self::metadata_reserve).
-    pub fn metadata_set(&self, id: crate::metadata::MetadataId, kind: crate::metadata::MetadataKind) {
+    pub fn metadata_set(
+        &self,
+        id: crate::metadata::MetadataId,
+        kind: crate::metadata::MetadataKind,
+    ) {
         self.metadata.borrow_mut().set(id, kind);
     }
 
@@ -1055,22 +1065,20 @@ impl<'ctx> Module<'ctx> {
         self.metadata.borrow().get(id).cloned()
     }
 
-    /// Number of interned metadata nodes.
+    /// Number of numbered metadata nodes. `MDString`s are uniqued metadata
+    /// operands, but LLVM does not assign them standalone `!N` slots.
     pub fn metadata_count(&self) -> usize {
-        self.metadata.borrow().len()
+        self.metadata
+            .borrow()
+            .nodes()
+            .iter()
+            .filter(|node| !matches!(node, crate::metadata::MetadataKind::String(_)))
+            .count()
     }
 
     /// Crate-internal: borrow the metadata store.
     pub(crate) fn metadata_store(&self) -> core::cell::Ref<'_, crate::metadata::MetadataStore> {
         self.metadata.borrow()
-    }
-
-    /// Crate-internal: mutably borrow the metadata store.
-    #[allow(dead_code)]
-    pub(crate) fn metadata_store_mut(
-        &self,
-    ) -> core::cell::RefMut<'_, crate::metadata::MetadataStore> {
-        self.metadata.borrow_mut()
     }
 
     /// Get or create a named metadata node with the given name.
@@ -1089,11 +1097,7 @@ impl<'ctx> Module<'ctx> {
     }
 
     /// Append an operand to a named metadata node (by index).
-    pub fn named_metadata_add_operand(
-        &self,
-        index: usize,
-        op: crate::metadata::MetadataRef,
-    ) {
+    pub fn named_metadata_add_operand(&self, index: usize, op: crate::metadata::MetadataRef) {
         self.named_metadata.borrow_mut()[index].add_operand(op);
     }
 
@@ -1103,9 +1107,7 @@ impl<'ctx> Module<'ctx> {
     }
 
     /// Crate-internal: borrow named metadata list for printing.
-    pub(crate) fn named_metadata_list(
-        &self,
-    ) -> core::cell::Ref<'_, Vec<NamedMDNode>> {
+    pub(crate) fn named_metadata_list(&self) -> core::cell::Ref<'_, Vec<NamedMDNode>> {
         self.named_metadata.borrow()
     }
 

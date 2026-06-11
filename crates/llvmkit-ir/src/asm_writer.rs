@@ -22,7 +22,7 @@
 //! arm at a time as their builders land.
 
 use core::fmt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::AttrIndex;
 use crate::attributes::{AttributeStorage, AttributeStored};
@@ -219,11 +219,12 @@ pub(crate) fn fmt_operand_ref(
             write!(f, "@{}", v.name().unwrap_or_default())
         }
         ValueKindData::Constant(c) => fmt_constant(f, v, c),
-        // `MetadataAsValue` prints just the `!N` reference; the
-        // surrounding `metadata` type comes from `fmt_operand` /
-        // `fmt_call` printing `{ty} {ref}`. Mirrors AsmWriter's
-        // `writeOperand` for a `MetadataAsValue` operand.
-        ValueKindData::MetadataAsValue(id) => write!(f, "!{}", id.index()),
+        // `MetadataAsValue` delegates to the metadata printer. MDStrings
+        // print inline as `!"..."`; MDNodes print as their numbered slot.
+        ValueKindData::MetadataAsValue(id) => {
+            let md = v.module().metadata_store();
+            fmt_metadata_operand(f, *id, &md, &metadata_slot_map(md.nodes()))
+        }
         // An inline-asm value only ever appears as a `call` callee, where
         // `fmt_call` short-circuits to the `asm "...", "..."` form before
         // reaching here. If one is reached as a bare operand (it should
@@ -240,10 +241,7 @@ pub(crate) fn fmt_operand_ref(
 /// `AssemblyWriter::writeOperand`'s `InlineAsm` arm in
 /// `lib/IR/AsmWriter.cpp`; the strings are escaped exactly like a
 /// `module asm` line (see [`print_escaped_string`]).
-fn fmt_inline_asm(
-    f: &mut fmt::Formatter<'_>,
-    d: &crate::inline_asm::InlineAsmData,
-) -> fmt::Result {
+fn fmt_inline_asm(f: &mut fmt::Formatter<'_>, d: &crate::inline_asm::InlineAsmData) -> fmt::Result {
     f.write_str("asm ")?;
     if d.has_side_effects {
         f.write_str("sideeffect ")?;
@@ -272,52 +270,74 @@ pub(crate) fn fmt_constant(
 ) -> fmt::Result {
     match c {
         ConstantData::Int(words) => fmt_int_constant(f, host.ty(), words),
+        ConstantData::GlobalValueRef { value } => {
+            let module = host.module.module();
+            let global = Value::from_parts(*value, module, module.context().value_data(*value).ty);
+            fmt_operand_ref(f, global, None)
+        }
         ConstantData::Float(bits) => fmt_float_constant(f, host.ty(), *bits),
         ConstantData::PointerNull => f.write_str("null"),
         ConstantData::Undef => f.write_str("undef"),
         ConstantData::Poison => f.write_str("poison"),
         ConstantData::Aggregate(elems) => fmt_aggregate_constant(f, host, elems),
         ConstantData::GepOffset { base_id, off } => {
-            // `getelementptr inbounds (i8, ptr @<base>, i64 <off>)` — the lone
-            // ConstantExpr form we materialise. The base value (a global or
-            // function) prints by name; the i8 element type makes the offset a
-            // raw byte count.
+            // `getelementptr inbounds (i8, <ptr-ty> @<base>, i64 <off>)`.
+            // Mirrors `writeConstantInternal` printing each ConstantExpr
+            // operand with its true type.
             let module = host.module.module();
-            let base = Value::from_parts(*base_id, module, module.context().value_data(*base_id).ty);
-            f.write_str("getelementptr inbounds (i8, ptr ")?;
+            let base =
+                Value::from_parts(*base_id, module, module.context().value_data(*base_id).ty);
+            write!(
+                f,
+                "getelementptr inbounds (i8, {} ",
+                constant_ptr_operand_type(base)
+            )?;
             fmt_operand_ref(f, base, None)?;
             write!(f, ", i64 {off})")
         }
         ConstantData::SymbolDelta { hi_id, lo_id } => {
-            // `sub (i64 ptrtoint (ptr @hi to i64), i64 ptrtoint (ptr @lo to i64))`
-            // — the link-time symbol-difference ConstantExpr. Each operand
-            // prints by name (a global or function); lld folds the subtraction
-            // into a single i64 relocation.
             let module = host.module.module();
             let hi = Value::from_parts(*hi_id, module, module.context().value_data(*hi_id).ty);
             let lo = Value::from_parts(*lo_id, module, module.context().value_data(*lo_id).ty);
-            f.write_str("sub (i64 ptrtoint (ptr ")?;
+            write!(f, "sub (i64 ptrtoint ({} ", constant_ptr_operand_type(hi))?;
             fmt_operand_ref(f, hi, None)?;
-            f.write_str(" to i64), i64 ptrtoint (ptr ")?;
+            write!(
+                f,
+                " to i64), i64 ptrtoint ({} ",
+                constant_ptr_operand_type(lo)
+            )?;
             fmt_operand_ref(f, lo, None)?;
             f.write_str(" to i64))")
         }
-        ConstantData::SymbolDeltaPlus { hi_id, lo_id, addend } => {
-            // `add (i64 sub (i64 ptrtoint (ptr @hi to i64), i64 ptrtoint (ptr @lo
-            // to i64)), i64 <addend>)` — the symbol difference with a constant
-            // addend. lld folds the whole nested add/sub into one additive i64
-            // relocation, so the encrypted delta `(real - anchor) + addend` is a
-            // real constant in the image without either absolute address known
-            // at emit time.
+        ConstantData::SymbolDeltaPlus {
+            hi_id,
+            lo_id,
+            addend,
+        } => {
             let module = host.module.module();
             let hi = Value::from_parts(*hi_id, module, module.context().value_data(*hi_id).ty);
             let lo = Value::from_parts(*lo_id, module, module.context().value_data(*lo_id).ty);
-            f.write_str("add (i64 sub (i64 ptrtoint (ptr ")?;
+            write!(
+                f,
+                "add (i64 sub (i64 ptrtoint ({} ",
+                constant_ptr_operand_type(hi)
+            )?;
             fmt_operand_ref(f, hi, None)?;
-            f.write_str(" to i64), i64 ptrtoint (ptr ")?;
+            write!(
+                f,
+                " to i64), i64 ptrtoint ({} ",
+                constant_ptr_operand_type(lo)
+            )?;
             fmt_operand_ref(f, lo, None)?;
             write!(f, " to i64)), i64 {addend})")
         }
+    }
+}
+
+fn constant_ptr_operand_type<'ctx>(value: Value<'ctx>) -> Type<'ctx> {
+    match &value.data().kind {
+        ValueKindData::Function(_) => value.module().ptr_type(0).as_type(),
+        _ => value.ty(),
     }
 }
 
@@ -615,8 +635,12 @@ fn fmt_cast(
     f.write_str(c.kind.keyword())?;
     match c.kind {
         CastOpcode::Trunc => {
-            if c.nuw { f.write_str(" nuw")?; }
-            if c.nsw { f.write_str(" nsw")?; }
+            if c.nuw {
+                f.write_str(" nuw")?;
+            }
+            if c.nsw {
+                f.write_str(" nsw")?;
+            }
         }
         CastOpcode::ZExt | CastOpcode::UIToFp if c.nneg => {
             f.write_str(" nneg")?;
@@ -1720,11 +1744,7 @@ pub(crate) fn fmt_function(
 /// packed). Mirrors the literal-struct arm of `Type`'s `Display`
 /// (`type.rs`), recursing into elements via `Type::new` — which renders a
 /// *named* element as `%Name` and any other type structurally.
-fn fmt_struct_body(
-    f: &mut fmt::Formatter<'_>,
-    body: &StructBody,
-    m: &Module<'_>,
-) -> fmt::Result {
+fn fmt_struct_body(f: &mut fmt::Formatter<'_>, body: &StructBody, m: &Module<'_>) -> fmt::Result {
     if body.packed {
         f.write_str("<{ ")?;
     } else {
@@ -1807,10 +1827,7 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
                 let s = data
                     .as_struct()
                     .expect("iter_named_struct_ids yields only struct ids");
-                let name = s
-                    .name
-                    .as_ref()
-                    .expect("named struct must have a name");
+                let name = s.name.as_ref().expect("named struct must have a name");
                 write!(f, "%{name} = type ")?;
                 match s.body.borrow().as_ref() {
                     Some(body) => fmt_struct_body(f, body, m)?,
@@ -1842,42 +1859,22 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
         fmt_function(f, func)?;
     }
 
-    // Collect the metadata ids referenced directly by named metadata.
-    // Named-metadata operands must be numbered `!N` references — clang
-    // rejects an inline `!"..."` there — so any MDString reachable this
-    // way must stay a standalone numbered node and is never inlined.
-    let named_md_refs: HashSet<usize> = {
-        let mut set = HashSet::new();
-        for node in m.named_metadata_list().iter() {
-            for op in node.operands() {
-                set.insert(op.0.index());
-            }
-        }
-        set
-    };
-
     // Numbered metadata nodes. Mirrors the
     // `for (const auto &[Slot, Node] : ...NumberedMetadata())`
-    // loop in `printModule`. Emitted as `!N = !{...}` or `!N = !""`.
+    // loop in `printModule`. MDStrings are not numbered; they print inline
+    // when referenced from MDNodes or MetadataAsValue operands.
     {
         let md = m.metadata_store();
         let nodes = md.nodes();
-        if !nodes.is_empty() {
-            // MDStrings inlined into a tuple body are not emitted as
-            // standalone `!N = !"..."` nodes (which clang rejects).
-            let inlinable = inlinable_string_ids(nodes, &named_md_refs);
-            let mut wrote_header = false;
+        let slots = metadata_slot_map(nodes);
+        if slots.iter().any(Option::is_some) {
+            f.write_str("\n")?;
             for (i, node) in nodes.iter().enumerate() {
-                if inlinable[i] {
-                    continue;
-                }
-                if !wrote_header {
+                if let Some(slot) = slots[i] {
+                    write!(f, "!{slot} = ")?;
+                    fmt_metadata_node(f, node, &md, &slots)?;
                     f.write_str("\n")?;
-                    wrote_header = true;
                 }
-                write!(f, "!{i} = ")?;
-                fmt_metadata_node(f, node, &md, &inlinable)?;
-                f.write_str("\n")?;
             }
         }
     }
@@ -1887,13 +1884,15 @@ pub(crate) fn fmt_module(f: &mut fmt::Formatter<'_>, m: &Module<'_>) -> fmt::Res
     {
         let nmd = m.named_metadata_list();
         if !nmd.is_empty() {
+            let md = m.metadata_store();
+            let slots = metadata_slot_map(md.nodes());
             for node in nmd.iter() {
                 write!(f, "!{} = !{{", node.name())?;
                 for (j, op) in node.operands().iter().enumerate() {
                     if j > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "!{}", op.0.index())?;
+                    fmt_metadata_operand(f, op.0, &md, &slots)?;
                 }
                 f.write_str("}\n")?;
             }
@@ -1914,15 +1913,13 @@ fn fmt_md_string(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
 /// Print one metadata node body. Mirrors `WriteMDNodeBodyInternal` in
 /// `lib/IR/AsmWriter.cpp`.
 ///
-/// Tuple operands flagged in `inlinable` are printed *inline*
-/// (`!{!"rsp"}`) rather than as a numbered reference. LLVM never numbers
-/// `MDString`s as standalone nodes — a top-level `!N = !"..."` is rejected
-/// by `clang`/`llvm-as` — so inlining keeps the emitted module parseable.
+/// Tuple MDString operands are printed *inline* (`!{!"rsp"}`) because LLVM
+/// never assigns standalone metadata slots to `MDString`s.
 fn fmt_metadata_node(
     f: &mut fmt::Formatter<'_>,
     node: &crate::metadata::MetadataKind,
     store: &crate::metadata::MetadataStore,
-    inlinable: &[bool],
+    slots: &[Option<usize>],
 ) -> fmt::Result {
     use crate::metadata::MetadataKind;
     match node {
@@ -1933,59 +1930,41 @@ fn fmt_metadata_node(
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                fmt_metadata_operand(f, op.0, store, inlinable)?;
+                fmt_metadata_operand(f, op.0, store, slots)?;
             }
             f.write_str("}")
         }
-        MetadataKind::Ref(id) => {
-            write!(f, "!{}", id.index())
-        }
+        MetadataKind::Ref(id) => fmt_metadata_operand(f, *id, store, slots),
     }
 }
 
-/// Print a single metadata operand. An `MDString` operand flagged
-/// `inlinable` is printed inline as `!"..."`; anything else is a numbered
-/// reference `!N`.
+/// Print a single metadata operand. `MDString` operands are inline; MDNodes
+/// are referenced by the renumbered slot map.
 fn fmt_metadata_operand(
     f: &mut fmt::Formatter<'_>,
     id: crate::metadata::MetadataId,
     store: &crate::metadata::MetadataStore,
-    inlinable: &[bool],
+    slots: &[Option<usize>],
 ) -> fmt::Result {
-    if inlinable.get(id.index()).copied().unwrap_or(false) {
-        if let Some(crate::metadata::MetadataKind::String(s)) = store.get(id) {
-            return fmt_md_string(f, s);
-        }
+    if let Some(crate::metadata::MetadataKind::String(s)) = store.get(id) {
+        return fmt_md_string(f, s);
     }
-    write!(f, "!{}", id.index())
+    match slots.get(id.index()).and_then(|slot| *slot) {
+        Some(slot) => write!(f, "!{slot}"),
+        None => write!(f, "!{}", id.index()),
+    }
 }
 
-/// Flag every `MDString` node that may be inlined into its referencing
-/// tuple body (and therefore omitted from the top-level numbered listing).
-/// A string is inlinable iff it is referenced by at least one tuple
-/// operand AND is not referenced by any named-metadata operand — the
-/// latter require a numbered `!N` reference, so such a string must remain
-/// a standalone node to keep every reference resolvable. Indexed by
-/// `MetadataId::index()`.
-fn inlinable_string_ids(
-    nodes: &[crate::metadata::MetadataKind],
-    named_md_refs: &HashSet<usize>,
-) -> Vec<bool> {
-    use crate::metadata::MetadataKind;
-    let mut inlinable = vec![false; nodes.len()];
-    for node in nodes {
-        if let MetadataKind::Tuple(operands) = node {
-            for op in operands {
-                let idx = op.0.index();
-                if !named_md_refs.contains(&idx)
-                    && matches!(nodes.get(idx), Some(MetadataKind::String(_)))
-                {
-                    inlinable[idx] = true;
-                }
-            }
+fn metadata_slot_map(nodes: &[crate::metadata::MetadataKind]) -> Vec<Option<usize>> {
+    let mut slots = vec![None; nodes.len()];
+    let mut next = 0;
+    for (i, node) in nodes.iter().enumerate() {
+        if !matches!(node, crate::metadata::MetadataKind::String(_)) {
+            slots[i] = Some(next);
+            next += 1;
         }
     }
-    inlinable
+    slots
 }
 
 fn fmt_comdat(f: &mut fmt::Formatter<'_>, c: crate::comdat::ComdatRef<'_>) -> fmt::Result {

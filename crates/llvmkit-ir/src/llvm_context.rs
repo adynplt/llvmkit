@@ -489,6 +489,16 @@ impl Context {
         id
     }
 
+    pub(crate) fn intern_constant_global_value_ref(&self, ty: TypeId, value: ValueId) -> ValueId {
+        self.push_value(ValueData {
+            ty,
+            name: core::cell::RefCell::new(None),
+            debug_loc: None,
+            kind: ValueKindData::Constant(ConstantData::GlobalValueRef { value }),
+            use_list: core::cell::RefCell::new(Vec::new()),
+        })
+    }
+
     /// Materialise a `getelementptr inbounds (i8, ptr @<base>, i64 <off>)`
     /// constant of pointer type `ty`. Not interned (each offset-pointer is
     /// effectively unique and cheap); a fresh value-arena node each call.
@@ -533,7 +543,11 @@ impl Context {
             ty,
             name: core::cell::RefCell::new(None),
             debug_loc: None,
-            kind: ValueKindData::Constant(ConstantData::SymbolDeltaPlus { hi_id, lo_id, addend }),
+            kind: ValueKindData::Constant(ConstantData::SymbolDeltaPlus {
+                hi_id,
+                lo_id,
+                addend,
+            }),
             use_list: core::cell::RefCell::new(Vec::new()),
         })
     }

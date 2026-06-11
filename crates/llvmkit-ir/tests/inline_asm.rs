@@ -5,6 +5,7 @@
 use llvmkit_ir::{AsmDialect, IRBuilder, IrError, Linkage, Module, Type};
 
 /// `%r = call i64 asm sideeffect "add $1, $0", "=r,r,r"(i64 %a, i64 %b)`.
+/// Mirrors `AsmWriter.cpp::writeAsOperandInternal(Value*)` inline-asm arm.
 /// Asserts the `asm` keyword, the `sideeffect` flag, the constraint
 /// string, the call result type (`i64`, not the callee's `ptr` type), and
 /// the argument operands all print.
@@ -63,6 +64,7 @@ fn inline_asm_call_with_side_effects() -> Result<(), IrError> {
 
 /// A no-`sideeffect` inline-asm call: the `sideeffect` keyword must be
 /// absent, but the bare `asm` keyword is still present.
+/// Mirrors `AsmWriter.cpp::writeAsOperandInternal(Value*)` inline-asm arm.
 #[test]
 fn inline_asm_call_without_side_effects() -> Result<(), IrError> {
     let m = Module::new("inline_asm_pure");
@@ -104,6 +106,8 @@ fn inline_asm_call_without_side_effects() -> Result<(), IrError> {
 /// A multi-line AT&T asm template: the embedded newline must be escaped in
 /// the printed string (mirrors `module asm` / string-constant escaping),
 /// not emitted as a literal line break inside the quotes.
+/// Mirrors `AsmWriter.cpp::writeAsOperandInternal(Value*)` string escaping for
+/// inline-asm callee operands.
 #[test]
 fn inline_asm_multiline_escapes_newline() -> Result<(), IrError> {
     let m = Module::new("inline_asm_multiline");
@@ -145,7 +149,63 @@ fn inline_asm_multiline_escapes_newline() -> Result<(), IrError> {
     Ok(())
 }
 
+/// Indirect call return marker must match the explicit function type.
+/// Mirrors `IRBuilder::CreateCall(FunctionType*, Value*, ...)`, where the
+/// result type is determined by `FunctionType`.
+#[test]
+fn indirect_call_rejects_wrong_return_marker() -> Result<(), IrError> {
+    let m = Module::new("indirect_marker");
+    let void_ty = m.void_type();
+    let ptr_ty = m.ptr_type(0);
+    let host_ty = m.fn_type(void_ty.as_type(), [ptr_ty.as_type()], false);
+    let host = m.add_function::<()>("host", host_ty, Linkage::External)?;
+    let entry = host.append_basic_block("entry");
+    let b = IRBuilder::new_for::<()>(&m).position_at_end(entry);
+    let callee_ptr = llvmkit_ir::PointerValue::try_from(host.param(0).expect("callee ptr"))?;
+    let callee_ty = m.fn_type(void_ty.as_type(), Vec::<llvmkit_ir::Type>::new(), false);
+    let err = b
+        .build_indirect_call::<i64, _, _>(
+            callee_ty,
+            callee_ptr,
+            Vec::<llvmkit_ir::Value>::new(),
+            "bad",
+        )
+        .expect_err("void function type cannot produce i64 call marker");
+    assert!(
+        err.to_string().contains("return"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+/// Label constraints are only legal with `callbr`, not ordinary `call`.
+/// Mirrors `Verifier::verifyInlineAsmCall` label constraint check.
+#[test]
+fn inline_asm_call_rejects_label_constraint() -> Result<(), IrError> {
+    let m = Module::new("asm_label_constraint");
+    let void_ty = m.void_type();
+    let host_ty = m.fn_type(void_ty.as_type(), Vec::<Type>::new(), false);
+    let host = m.add_function::<()>("host", host_ty, Linkage::External)?;
+    let entry = host.append_basic_block("entry");
+    let b = IRBuilder::new_for::<()>(&m).position_at_end(entry);
+    let asm_ty = m.fn_type(void_ty.as_type(), Vec::<Type>::new(), false);
+    let asm = m.inline_asm(asm_ty, "", "!i", false, false, AsmDialect::ATT);
+    b.build_inline_asm_call::<(), _, _>(asm, Vec::<llvmkit_ir::Value>::new(), "")?;
+    b.build_ret_void();
+    let err = m
+        .verify_borrowed()
+        .expect_err("ordinary call with label constraint must fail");
+    assert!(
+        err.to_string()
+            .contains("Label constraints can only be used with callbr"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
 /// Intel-dialect asm prints the `inteldialect` keyword after `asm`.
+/// Mirrors `AsmWriter.cpp::writeAsOperandInternal(Value*)` inline-asm dialect
+/// keyword printing.
 #[test]
 fn inline_asm_intel_dialect_keyword() -> Result<(), IrError> {
     let m = Module::new("inline_asm_intel");

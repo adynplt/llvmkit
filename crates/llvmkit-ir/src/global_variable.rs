@@ -116,6 +116,23 @@ impl<'ctx> GlobalVariable<'ctx> {
         }
     }
 
+    /// View this global as a pointer-typed constant reference. Mirrors
+    /// `GlobalValue::getType`: the global's stored value type is separate from
+    /// the `ptr addrspace(N)` type used when its address appears as a constant.
+    #[inline]
+    pub fn as_global_constant_ptr(self) -> Constant<'ctx> {
+        let module = self.module.module();
+        let ptr_ty = module.ptr_type(self.address_space()).as_type().id();
+        let id = module
+            .context()
+            .intern_constant_global_value_ref(ptr_ty, self.id);
+        Constant {
+            id,
+            module: self.module,
+            ty: ptr_ty,
+        }
+    }
+
     /// A `ptr`-typed constant pointing `off` bytes into this global, printed as
     /// `getelementptr inbounds (i8, ptr @<self>, i64 off)`.
     ///
@@ -138,6 +155,21 @@ impl<'ctx> GlobalVariable<'ctx> {
         }
     }
 
+    /// A `ptr`-typed constant pointing `off` bytes into this global, preserving
+    /// this global's address space in both the GEP result and pointer operand.
+    pub fn ptr_offset(self, off: i64) -> Constant<'ctx> {
+        let module = self.module.module();
+        let ptr_ty = module.ptr_type(self.address_space()).as_type().id();
+        let id = module
+            .context()
+            .intern_constant_gep_offset(ptr_ty, self.id, off);
+        Constant {
+            id,
+            module: self.module,
+            ty: ptr_ty,
+        }
+    }
+
     /// An `i64` constant equal to `self_addr - other_addr`, printed as the
     /// const-expr `sub (i64 ptrtoint (ptr @self to i64), i64 ptrtoint (ptr
     /// @other to i64))`.
@@ -147,45 +179,49 @@ impl<'ctx> GlobalVariable<'ctx> {
     /// global initializer. lld resolves the subtraction at link time, so the
     /// delta is a real constant in the image without either absolute address
     /// being known at emit time. Use it to express an address as
-    /// `anchor + (real - anchor)` while keeping `real` out of the code stream:
-    /// store `real.delta_from(anchor)` in a data global and add it to
+    /// store `real.try_delta_from(anchor)?` in a data global and add it to
     /// `ptrtoint @anchor` at the use site. Both globals must be defined symbols
     /// in the final image.
-    pub fn delta_from(self, other: GlobalVariable<'ctx>) -> Constant<'ctx> {
+    pub fn try_delta_from(
+        self,
+        other: GlobalVariable<'ctx>,
+    ) -> IrResult<crate::ConstantIntValue<'ctx, i64>> {
+        if self.module != other.module {
+            return Err(IrError::ForeignValue);
+        }
         let module = self.module.module();
         let i64_ty = module.i64_type().as_type().id();
         let id = module
             .context()
             .intern_constant_symbol_delta(i64_ty, self.id, other.id);
-        Constant {
+        Ok(crate::ConstantIntValue::from_parts_typed(Constant {
             id,
             module: self.module,
             ty: i64_ty,
-        }
+        }))
     }
 
     /// An `i64` constant equal to `(self_addr - other_addr) + addend`, printed
-    /// as `add (i64 sub (i64 ptrtoint (ptr @self to i64), i64 ptrtoint (ptr
-    /// @other to i64)), i64 addend)`.
-    ///
-    /// Like [`Self::delta_from`] but with a baked-in constant `addend` the
-    /// linker folds into the same additive relocation. Use it to store an
-    /// *encrypted* delta `(real - anchor) + K` in a data global so the runtime
-    /// recovers `real` as `anchor + (enc - K)` — a genuine subtraction the
-    /// optimizer cannot fold to a passthrough (unlike a bare delta wrapped in
-    /// identity arithmetic). Both globals must be defined symbols in the final
-    /// image.
-    pub fn delta_from_plus(self, other: GlobalVariable<'ctx>, addend: i64) -> Constant<'ctx> {
+    /// as `add (i64 sub (i64 ptrtoint(@real), i64 ptrtoint(@anchor)),
+    /// i64 K)` -- the encrypted-delta form.
+    pub fn try_delta_from_plus(
+        self,
+        other: GlobalVariable<'ctx>,
+        addend: i64,
+    ) -> IrResult<crate::ConstantIntValue<'ctx, i64>> {
+        if self.module != other.module {
+            return Err(IrError::ForeignValue);
+        }
         let module = self.module.module();
         let i64_ty = module.i64_type().as_type().id();
         let id = module
             .context()
             .intern_constant_symbol_delta_plus(i64_ty, self.id, other.id, addend);
-        Constant {
+        Ok(crate::ConstantIntValue::from_parts_typed(Constant {
             id,
             module: self.module,
             ty: i64_ty,
-        }
+        }))
     }
 
     fn data(self) -> &'ctx GlobalVariableData {

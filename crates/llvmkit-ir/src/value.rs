@@ -118,7 +118,10 @@ pub(crate) struct ValueData {
 #[derive(Debug)]
 pub(crate) enum ValueKindData {
     Constant(ConstantData),
-    Argument { parent_fn: ValueId, slot: u32 },
+    Argument {
+        parent_fn: ValueId,
+        slot: u32,
+    },
     BasicBlock(BasicBlockData),
     Function(FunctionData),
     Instruction(InstructionData),
