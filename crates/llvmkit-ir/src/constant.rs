@@ -54,6 +54,10 @@ pub(crate) enum ConstantData {
     /// `FloatType`. Stored as a `u128` so every IEEE width up to
     /// `fp128` fits without a discriminant tag.
     Float(u128),
+    /// A pointer-typed constant reference to a function or global value.
+    /// Mirrors `GlobalValue` being a `Constant` whose `getType()` is the
+    /// pointer type while `getValueType()` stores the pointee/function type.
+    GlobalValueRef { value: ValueId },
     /// `null` of a pointer or typed-pointer type.
     PointerNull,
     /// Aggregate constant — `ConstantArray`, `ConstantStruct`, or
@@ -88,7 +92,11 @@ pub(crate) enum ConstantData {
     /// the bare delta, giving the runtime decrypt a genuine (non-identity)
     /// computation the optimizer cannot fold away. The two symbol ids must
     /// differ; the owning value's type is `i64`.
-    SymbolDeltaPlus { hi_id: ValueId, lo_id: ValueId, addend: i64 },
+    SymbolDeltaPlus {
+        hi_id: ValueId,
+        lo_id: ValueId,
+        addend: i64,
+    },
     /// `undef` of any first-class type.
     Undef,
     /// `poison` of any first-class type. Distinct from `undef` per

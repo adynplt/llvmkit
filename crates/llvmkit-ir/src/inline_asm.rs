@@ -58,6 +58,11 @@ pub enum AsmDialect {
 /// [`ValueKindData::InlineAsm`](crate::value::ValueKindData::InlineAsm).
 /// Mirrors the data portion of `class InlineAsm` in
 /// `llvm/include/llvm/IR/InlineAsm.h`.
+pub(crate) struct InlineAsmConstraintSummary {
+    pub label_count: usize,
+    pub arg_constraints: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct InlineAsmData {
     /// The assembly template string (the `AsmString` field in LLVM).
@@ -151,8 +156,20 @@ impl<'ctx> InlineAsm<'ctx> {
 
     /// The constraint string. Mirrors `InlineAsm::getConstraintString()`.
     #[inline]
-    pub fn constraint_string(self) -> &'ctx str {
+    pub fn constraint_string(&self) -> &'ctx str {
         &self.payload().constraint_string
+    }
+
+    pub(crate) fn constraint_summary(&self) -> InlineAsmConstraintSummary {
+        let label_count = self
+            .constraint_string()
+            .split(',')
+            .filter(|constraint| constraint.contains('!'))
+            .count();
+        InlineAsmConstraintSummary {
+            label_count,
+            arg_constraints: 0,
+        }
     }
 
     /// `true` when the `sideeffect` keyword is set. Mirrors
@@ -177,7 +194,7 @@ impl<'ctx> InlineAsm<'ctx> {
 
     /// Borrow the underlying payload via the module's value arena.
     #[inline]
-    fn payload(self) -> &'ctx InlineAsmData {
+    fn payload(&self) -> &'ctx InlineAsmData {
         match &self.module.module().context().value_data(self.id).kind {
             crate::value::ValueKindData::InlineAsm(d) => d,
             _ => unreachable!("InlineAsm handle invariant: kind is InlineAsm"),

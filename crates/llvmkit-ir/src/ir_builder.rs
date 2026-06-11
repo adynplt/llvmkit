@@ -313,23 +313,31 @@ where
         let inst_data = self.module.context().value_data(phi_val.id);
         let inst_kind_data = match &inst_data.kind {
             crate::value::ValueKindData::Instruction(i) => &i.kind,
-            _ => return Err(IrError::InvalidOperation {
-                message: "phi_add_incoming_from_value: target is not an instruction",
-            }),
+            _ => {
+                return Err(IrError::InvalidOperation {
+                    message: "phi_add_incoming_from_value: target is not an instruction",
+                });
+            }
         };
         let phi_payload = match inst_kind_data {
             InstructionKindData::Phi(p) => p,
-            _ => return Err(IrError::InvalidOperation {
-                message: "phi_add_incoming_from_value: instruction is not a phi",
-            }),
+            _ => {
+                return Err(IrError::InvalidOperation {
+                    message: "phi_add_incoming_from_value: instruction is not a phi",
+                });
+            }
         };
-        phi_payload.incoming.borrow_mut().push((
-            core::cell::Cell::new(val.id),
-            block.as_value().id,
-        ));
+        phi_payload
+            .incoming
+            .borrow_mut()
+            .push((core::cell::Cell::new(val.id), block.as_value().id));
         // Register phi as a user of the incoming value.
-        self.module.context().value_data(val.id)
-            .use_list.borrow_mut().push(phi_val.id);
+        self.module
+            .context()
+            .value_data(val.id)
+            .use_list
+            .borrow_mut()
+            .push(phi_val.id);
         Ok(())
     }
 }
@@ -1164,7 +1172,9 @@ where
         payload.fmf = fmf;
         let inst =
             self.append_instruction(crate::value::Typed::ty(lhs).id(), kind_ctor(payload), name);
-        Ok(crate::value::FloatValue::<K>::from_value_unchecked(inst.as_value()))
+        Ok(crate::value::FloatValue::<K>::from_value_unchecked(
+            inst.as_value(),
+        ))
     }
 
     /// `fadd` with an explicit [`crate::fmf::FastMathFlags`] parameter.
@@ -2072,14 +2082,10 @@ where
                 rhs: dst_w,
             });
         }
-        let mut payload =
-            CastOpData::new(crate::instr_types::CastOpcode::ZExt, src.as_value().id);
+        let mut payload = CastOpData::new(crate::instr_types::CastOpcode::ZExt, src.as_value().id);
         payload.nneg = flags.nneg;
-        let inst = self.append_instruction(
-            dst.as_type().id(),
-            InstructionKindData::Cast(payload),
-            name,
-        );
+        let inst =
+            self.append_instruction(dst.as_type().id(), InstructionKindData::Cast(payload), name);
         Ok(IntValue::<crate::int_width::IntDyn>::from_value_unchecked(
             inst.as_value(),
         ))
@@ -2758,6 +2764,13 @@ where
         V: crate::value::IsValue<'ctx>,
     {
         let callee_v = crate::value::IsValue::as_value(callee);
+        let ret_data = self.module.context().type_data(fn_ty.return_type().id());
+        if !crate::function::signature_matches_marker::<R2>(ret_data) {
+            return Err(IrError::ReturnTypeMismatch {
+                expected: fn_ty.return_type().kind_label(),
+                got: fn_ty.return_type().kind_label(),
+            });
+        }
         self.require_same_module(callee_v)?;
         let mut arg_ids: Vec<crate::value::ValueId> = Vec::new();
         for arg in args {
@@ -2812,10 +2825,7 @@ where
         let fn_ty = asm.function_type();
         // Reject a return-marker / signature mismatch up front, mirroring
         // `Module::add_function`'s `signature_matches_marker` gate.
-        let ret_data = self
-            .module
-            .context()
-            .type_data(fn_ty.return_type().id());
+        let ret_data = self.module.context().type_data(fn_ty.return_type().id());
         if !crate::function::signature_matches_marker::<R2>(ret_data) {
             return Err(IrError::ReturnTypeMismatch {
                 expected: fn_ty.return_type().kind_label(),
@@ -3034,9 +3044,11 @@ where
             InstructionKindData::Cast(payload),
             name,
         );
-        Ok(crate::value::FloatValue::<crate::float_kind::FloatDyn>::from_value_unchecked(
-            inst.as_value(),
-        ))
+        Ok(
+            crate::value::FloatValue::<crate::float_kind::FloatDyn>::from_value_unchecked(
+                inst.as_value(),
+            ),
+        )
     }
 
     /// Runtime-kind `fpext`. Mirrors [`Self::build_fp_ext`] but accepts
@@ -3060,9 +3072,11 @@ where
             InstructionKindData::Cast(payload),
             name,
         );
-        Ok(crate::value::FloatValue::<crate::float_kind::FloatDyn>::from_value_unchecked(
-            inst.as_value(),
-        ))
+        Ok(
+            crate::value::FloatValue::<crate::float_kind::FloatDyn>::from_value_unchecked(
+                inst.as_value(),
+            ),
+        )
     }
 
     /// Crate-internal helper for `build_fp_ext` / `build_fp_trunc`.
@@ -3186,14 +3200,13 @@ where
         let mut payload =
             CastOpData::new(crate::instr_types::CastOpcode::UIToFp, src.as_value().id);
         payload.nneg = flags.nneg;
-        let inst = self.append_instruction(
-            dst.as_type().id(),
-            InstructionKindData::Cast(payload),
-            name,
-        );
-        Ok(crate::value::FloatValue::<crate::float_kind::FloatDyn>::from_value_unchecked(
-            inst.as_value(),
-        ))
+        let inst =
+            self.append_instruction(dst.as_type().id(), InstructionKindData::Cast(payload), name);
+        Ok(
+            crate::value::FloatValue::<crate::float_kind::FloatDyn>::from_value_unchecked(
+                inst.as_value(),
+            ),
+        )
     }
 
     fn build_int_to_fp<W, K>(
@@ -3426,11 +3439,7 @@ where
     ) -> IrResult<crate::value::Value<'ctx>> {
         self.require_same_module(value)?;
         let payload = CastOpData::new(super::instr_types::CastOpcode::BitCast, value.id);
-        let inst = self.append_instruction(
-            dst_ty.id(),
-            InstructionKindData::Cast(payload),
-            name,
-        );
+        let inst = self.append_instruction(dst_ty.id(), InstructionKindData::Cast(payload), name);
         Ok(inst.as_value())
     }
 
@@ -3995,7 +4004,6 @@ where
             inst.ty().id(),
         ))
     }
-
 
     // ---- Branch / Unreachable ----
 

@@ -14,7 +14,8 @@ use llvmkit_ir::{
 /// Build the read/write named-register intrinsics, emit calls whose
 /// argument is a `metadata` node, and assert the printed module carries
 /// the `metadata !N` operands plus the `!{` node defining the register
-/// string. Mirrors `test/CodeGen/X86/read-register.ll`-style IR.
+/// string. Mirrors `AsmWriter.cpp::writeAsOperandInternal(Value*)` for
+/// `MetadataAsValue` call operands.
 #[test]
 fn call_with_metadata_argument() -> Result<(), IrError> {
     let m = Module::new("named_registers");
@@ -31,9 +32,12 @@ fn call_with_metadata_argument() -> Result<(), IrError> {
     let read_ty = m.fn_type(i64_ty, [md_ty.as_type()], false);
     let read = m.add_function::<i64>("llvm.read_register.i64", read_ty, Linkage::External)?;
     // declare void @llvm.write_register.i64(metadata, i64)
-    let write_ty = m.fn_type(void_ty.as_type(), [md_ty.as_type(), i64_ty.as_type()], false);
-    let write =
-        m.add_function::<()>("llvm.write_register.i64", write_ty, Linkage::External)?;
+    let write_ty = m.fn_type(
+        void_ty.as_type(),
+        [md_ty.as_type(), i64_ty.as_type()],
+        false,
+    );
+    let write = m.add_function::<()>("llvm.write_register.i64", write_ty, Linkage::External)?;
 
     // define i64 @get_sp() { %rsp = call ...; call void ...; ret i64 %rsp }
     let host_ty = m.fn_type(i64_ty, Vec::<llvmkit_ir::Type>::new(), false);
@@ -90,10 +94,7 @@ fn post_construction_function_attributes() -> Result<(), IrError> {
     let text = format!("{m}");
     assert!(text.contains("noredzone"), "output:\n{text}");
     assert!(text.contains("naked"), "output:\n{text}");
-    assert!(
-        text.contains(r#""frame-pointer"="all""#),
-        "output:\n{text}"
-    );
+    assert!(text.contains(r#""frame-pointer"="all""#), "output:\n{text}");
     Ok(())
 }
 
@@ -111,22 +112,50 @@ fn metadata_as_value_is_uniqued() {
     assert_eq!(a, b, "same metadata node must yield the same Value");
 }
 
-/// A string referenced by both a tuple and a named-metadata node must not
-/// produce a dangling `!N`: named-metadata operands require a numbered
-/// reference (clang rejects an inline `!"..."` there), so the string stays
-/// a standalone node that every reference can resolve. Regression test for
-/// the inlining/skip interaction.
+/// A bare MDString used through `MetadataAsValue` prints inline as `!"rsp"`,
+/// not as a numbered top-level `!N = !"rsp"` definition.
+/// Mirrors `AsmWriter.cpp::writeAsOperandInternal(Metadata*)` MDString arm.
+#[test]
+fn metadata_string_as_value_prints_inline() -> Result<(), IrError> {
+    let m = Module::new("md_string_value");
+    let void_ty = m.void_type();
+    let md_ty = m.metadata_type();
+    let fn_ty = m.fn_type(void_ty.as_type(), [md_ty.as_type()], false);
+    let g = m.add_function::<()>("g", fn_ty, Linkage::External)?;
+    let host_ty = m.fn_type(void_ty.as_type(), Vec::<llvmkit_ir::Type>::new(), false);
+    let f = m.add_function::<()>("f", host_ty, Linkage::External)?;
+    let entry = f.append_basic_block("entry");
+    let b = IRBuilder::new_for::<()>(&m).position_at_end(entry);
+    let s = m.metadata_string("rsp");
+    let md = m.metadata_as_value(s);
+    b.build_call(g, [md], "")?;
+    b.build_ret_void();
+
+    let text = format!("{m}");
+    assert!(
+        text.contains(r#"call void @g(metadata !"rsp")"#),
+        "output:\n{text}"
+    );
+    assert!(
+        !text.contains(r#" = !"rsp""#),
+        "MDString must not be top-level numbered:\n{text}"
+    );
+    Ok(())
+}
+
+/// Named metadata operands are MDNode references; MDStrings inside those nodes
+/// still print inline in the referenced tuple body.
+/// Mirrors `AsmWriter.cpp::writeAllMDNodes` emitting only MDNodes while
+/// `AsmWriter.cpp::writeAsOperandInternal(Metadata*)` prints MDStrings inline.
 #[test]
 fn string_referenced_by_named_metadata_is_not_dangling() {
     let m = Module::new("d");
     let s = m.metadata_string("x");
-    let _tuple = m.metadata_tuple([MetadataRef(s)]); // !{!0}
+    let tuple = m.metadata_tuple([MetadataRef(s)]);
     let idx = m.get_or_insert_named_metadata("my.named");
-    m.named_metadata_add_operand(idx, MetadataRef(s)); // !{!0}
+    m.named_metadata_add_operand(idx, MetadataRef(tuple));
 
     let text = format!("{m}");
-    // The string is referenced by name, so it must be emitted standalone…
-    assert!(text.contains(r#"!0 = !"x""#), "output:\n{text}");
-    // …and both references resolve to that node (no inlining → no dangling).
+    assert!(text.contains(r#"!0 = !{!"x"}"#), "output:\n{text}");
     assert!(text.contains("!my.named = !{!0}"), "output:\n{text}");
 }

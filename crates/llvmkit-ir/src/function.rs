@@ -397,22 +397,18 @@ impl<'ctx, R: ReturnMarker> FunctionValue<'ctx, R> {
     /// name — i.e. the constant `ptr @<name>`, suitable as a global
     /// initializer.
     ///
-    /// There is no in-arena `ConstantExpr` here, so a function's address
-    /// cannot be spelled `ptrtoint (ptr @f to i64)`. But a function symbol
-    /// *is* a constant pointer (`@f` has pointer type at any use site), and
-    /// the assembly writer prints any value whose arena kind is `Function`
-    /// by name (`@f`) regardless of the handle's reported type. This returns
-    /// a [`Constant`](crate::constant::Constant) handle carrying the
-    /// function's value-id (so it prints as `@<name>`) but reporting type
-    /// `ptr addrspace(addr_space)` — exactly what
-    /// `Module::add_global_constant(name, ptr_ty, this)` needs to emit
-    /// `@g = constant ptr @f`. Load that global as a `ptr` at run time to
-    /// recover the linker-resolved address.
+    /// Mirrors LLVM's `GlobalValue`: the function's value type remains its
+    /// signature, while the constant's type is the default-address-space
+    /// pointer returned by `GlobalValue::getType`.
     #[inline]
-    pub fn as_global_constant_ptr(self, addr_space: u32) -> crate::constant::Constant<'ctx> {
-        let ptr_ty = self.module.module().ptr_type(addr_space).as_type().id();
+    pub fn as_global_constant_ptr(self) -> crate::constant::Constant<'ctx> {
+        let module = self.module.module();
+        let ptr_ty = module.ptr_type(0).as_type().id();
+        let id = module
+            .context()
+            .intern_constant_global_value_ref(ptr_ty, self.id);
         crate::constant::Constant {
-            id: self.id,
+            id,
             module: self.module,
             ty: ptr_ty,
         }
@@ -432,7 +428,9 @@ impl<'ctx, R: ReturnMarker> FunctionValue<'ctx, R> {
     pub fn as_aggregate_ptr(self, addr_space: u32) -> crate::constant::Constant<'ctx> {
         let module = self.module.module();
         let ptr_ty = module.ptr_type(addr_space).as_type().id();
-        let id = module.context().intern_constant_gep_offset(ptr_ty, self.id, 0);
+        let id = module
+            .context()
+            .intern_constant_gep_offset(ptr_ty, self.id, 0);
         crate::constant::Constant {
             id,
             module: self.module,

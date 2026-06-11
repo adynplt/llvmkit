@@ -32,8 +32,8 @@
 use std::collections::HashMap;
 
 use llvmkit_ir::{
-    Align, AnyTypeEnum, AtomicOrdering, FastMathFlags, IrError, Linkage, Module,
-    StructType, SyncScope, Type, derived_types::PointerType,
+    Align, AnyTypeEnum, AtomicOrdering, FastMathFlags, IrError, Linkage, Module, StructType,
+    SyncScope, Type, derived_types::PointerType,
 };
 use llvmkit_support::{Span, Spanned};
 
@@ -151,6 +151,12 @@ struct TypeEntry<'ctx> {
     ty: Type<'ctx>,
 }
 
+struct MetadataSlotEntry {
+    id: llvmkit_ir::metadata::MetadataId,
+    defined: bool,
+    first_ref: Span,
+}
+
 // ── Parser ───────────────────────────────────────────────────────────────────
 
 /// Core parser state. Holds the lexer, a one-token cache, the IR module
@@ -176,12 +182,9 @@ pub struct Parser<'src, 'ctx> {
     /// Numbered global / function table. Exposed via [`Parser::take_slot_mapping`].
     numbered_globals: NumberedValues<GlobalRef<'ctx>>,
 
-    /// Maps a textual metadata slot (`!N`) to the `MetadataId` it names.
-    /// Decouples textual slot numbers from arena indices: definitions can
-    /// appear out of order, be non-contiguous, or dedup (identical
-    /// strings), and forward references reserve a placeholder id that the
-    /// later `!N = ...` definition fills in.
-    metadata_slots: HashMap<u32, llvmkit_ir::metadata::MetadataId>,
+    /// Maps a textual metadata slot (`!N`) to the `MetadataId` it names and
+    /// whether a matching `!N = ...` definition was seen.
+    metadata_slots: HashMap<u32, MetadataSlotEntry>,
 }
 
 /// What the parser produces at end-of-module. Successful runs return the
@@ -211,16 +214,52 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         })
     }
 
-    /// Resolve a textual metadata slot `!slot` to its `MetadataId`,
-    /// reserving a placeholder node on first sight so forward references
-    /// (`!N` before `!N = ...`) bind to a stable id.
-    fn resolve_md_slot(&mut self, slot: u32) -> llvmkit_ir::metadata::MetadataId {
-        if let Some(&id) = self.metadata_slots.get(&slot) {
-            return id;
+    fn resolve_md_slot(&mut self, slot: u32, loc: Span) -> llvmkit_ir::metadata::MetadataId {
+        if let Some(entry) = self.metadata_slots.get(&slot) {
+            return entry.id;
         }
         let id = self.module.metadata_reserve();
-        self.metadata_slots.insert(slot, id);
+        self.metadata_slots.insert(
+            slot,
+            MetadataSlotEntry {
+                id,
+                defined: false,
+                first_ref: loc,
+            },
+        );
         id
+    }
+
+    fn define_md_slot(
+        &mut self,
+        slot: u32,
+        content: llvmkit_ir::metadata::MetadataKind,
+        loc: Span,
+    ) -> ParseResult<llvmkit_ir::metadata::MetadataId> {
+        if let Some(entry) = self.metadata_slots.get_mut(&slot) {
+            if entry.defined {
+                return Err(ParseError::Redefinition {
+                    kind: crate::parse_error::SymbolKind::Metadata,
+                    id: crate::parse_error::SymbolId::Numbered(slot),
+                    loc: DiagLoc::span(loc),
+                });
+            }
+            self.module.metadata_set(entry.id, content);
+            entry.defined = true;
+            return Ok(entry.id);
+        }
+
+        let id = self.module.metadata_reserve();
+        self.module.metadata_set(id, content);
+        self.metadata_slots.insert(
+            slot,
+            MetadataSlotEntry {
+                id,
+                defined: true,
+                first_ref: loc,
+            },
+        );
+        Ok(id)
     }
 
     /// Drive the parser to EOF. Mirrors `LLParser::Run` over the
@@ -253,6 +292,16 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         // does not error on opaque structs that were referenced but never
         // bodied; only `LLParser`'s `error(forward_loc, ...)` paths flag
         // the truly malformed cases.
+
+        for (slot, entry) in &self.metadata_slots {
+            if !entry.defined {
+                return Err(ParseError::UndefinedSymbol {
+                    kind: crate::parse_error::SymbolKind::Metadata,
+                    id: crate::parse_error::SymbolId::Numbered(*slot),
+                    loc: DiagLoc::span(entry.first_ref),
+                });
+            }
+        }
 
         Ok(ParsedModule {
             slot_mapping: self.into_slot_mapping(),
@@ -553,7 +602,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         })
     }
 
-
     fn current_str_payload(&self) -> Option<String> {
         match self.peek() {
             Token::GlobalVar(s) | Token::LocalVar(s) => {
@@ -623,11 +671,9 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
     ///
     /// Syntax:
     ///   `!0 = !{...}`
-    ///   `!0 = !"string"`
     ///   `!0 = distinct !{...}`
     fn parse_standalone_metadata(&mut self) -> ParseResult<()> {
-        // Eat `!`
-        self.bump()?; // consume Token::Exclaim
+        let loc = self.bump()?; // consume Token::Exclaim
 
         // Parse the textual slot number.
         let slot = self.parse_uint32("metadata slot number after '!'")?;
@@ -640,12 +686,21 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             self.bump()?;
         }
 
-        let content = self.parse_md_node_content()?;
-        // Bind the textual slot to a stable id (reserving one if this slot
-        // was forward-referenced) and fill in the parsed content. This
-        // keeps `!N` references correct regardless of definition order.
-        let id = self.resolve_md_slot(slot);
-        self.module.metadata_set(id, content);
+        self.expect_exclaim("'!' before metadata tuple")?;
+        self.expect_punct(PunctKind::LBrace, "'{' in standalone metadata")?;
+        let mut operands = Vec::new();
+        if !matches!(self.peek(), Token::RBrace) {
+            loop {
+                operands.push(self.parse_md_tuple_operand()?);
+                if !self.eat_punct(PunctKind::Comma)? {
+                    break;
+                }
+            }
+        }
+        self.expect_punct(PunctKind::RBrace, "'}' closing standalone metadata")?;
+        let content = llvmkit_ir::metadata::MetadataKind::Tuple(operands);
+
+        self.define_md_slot(slot, content, loc)?;
 
         Ok(())
     }
@@ -655,11 +710,9 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         use llvmkit_ir::metadata::MetadataRef;
 
         let name = match self.peek() {
-            Token::MetadataVar(bytes) => {
-                std::str::from_utf8(bytes.as_ref())
-                    .map_err(|_| self.expected("valid UTF-8 metadata name"))?
-                    .to_owned()
-            }
+            Token::MetadataVar(bytes) => std::str::from_utf8(bytes.as_ref())
+                .map_err(|_| self.expected("valid UTF-8 metadata name"))?
+                .to_owned(),
             _ => return Err(self.expected("metadata name")),
         };
         self.bump()?;
@@ -669,15 +722,15 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         // `!{ !N, !N, ... }`
         self.expect_exclaim("'!' before '{' in named metadata")?;
         self.expect_punct(PunctKind::LBrace, "'{' in named metadata")?;
-
         let nmd_idx = self.module.get_or_insert_named_metadata(&name);
 
         // Parse comma-separated `!N` operands
         if !matches!(self.peek(), Token::RBrace) {
             loop {
                 self.expect_exclaim("'!' before metadata operand")?;
+                let loc = self.loc();
                 let slot = self.parse_uint32("metadata operand number")?;
-                let id = self.resolve_md_slot(slot);
+                let id = self.resolve_md_slot(slot, loc);
                 self.module
                     .named_metadata_add_operand(nmd_idx, MetadataRef(id));
                 if !self.eat_punct(PunctKind::Comma)? {
@@ -691,20 +744,19 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
     }
 
     /// Parse a metadata node body into its content: `!"string"` or
-    /// `!{ operand, ... }`. Tuple operands may be inline `!"string"`
-    /// (an interned MDString) or numbered `!N` references.
-    fn parse_md_node_content(&mut self) -> ParseResult<llvmkit_ir::metadata::MetadataKind> {
-        use llvmkit_ir::metadata::MetadataKind;
-
-        self.expect_exclaim("'!' before metadata node body")?;
-
-        match self.peek() {
+    /// Parse a `metadata`-typed value operand. Mirrors
+    /// `LLParser::parseMetadataAsValue` delegating to `parseMetadata`: slot
+    /// refs (`!N`), inline tuples (`!{...}`), and MDStrings (`!"..."`) are
+    /// all legal metadata values.
+    fn parse_metadata_value_operand(&mut self) -> ParseResult<llvmkit_ir::Value<'ctx>> {
+        self.expect_exclaim("'!' in metadata operand")?;
+        let id = match self.peek() {
             Token::StringConstant(_) => {
                 let s = self.parse_string_constant("metadata string")?;
-                Ok(MetadataKind::String(s))
+                self.module.metadata_string(s)
             }
             Token::LBrace => {
-                self.bump()?; // eat '{'
+                self.bump()?;
                 let mut operands = Vec::new();
                 if !matches!(self.peek(), Token::RBrace) {
                     loop {
@@ -715,10 +767,42 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                     }
                 }
                 self.expect_punct(PunctKind::RBrace, "'}' closing metadata tuple")?;
-                Ok(MetadataKind::Tuple(operands))
+                self.module.metadata_tuple(operands)
             }
-            _ => Err(self.expected("metadata string or tuple")),
+            _ => {
+                let loc = self.loc();
+                let slot = self.parse_uint32("metadata slot number after '!'")?;
+                self.resolve_md_slot(slot, loc)
+            }
+        };
+        Ok(self.module.metadata_as_value(id))
+    }
+
+    fn parse_metadata_attachment_operand(&mut self) -> ParseResult<()> {
+        self.expect_exclaim("'!' in metadata attachment")?;
+        match self.peek() {
+            Token::StringConstant(_) => {
+                let _ = self.parse_string_constant("metadata string")?;
+            }
+            Token::LBrace => {
+                self.bump()?;
+                if !matches!(self.peek(), Token::RBrace) {
+                    loop {
+                        let _ = self.parse_md_tuple_operand()?;
+                        if !self.eat_punct(PunctKind::Comma)? {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(PunctKind::RBrace, "'}' closing metadata tuple")?;
+            }
+            _ => {
+                let loc = self.loc();
+                let slot = self.parse_uint32("metadata slot number after '!'")?;
+                let _ = self.resolve_md_slot(slot, loc);
+            }
         }
+        Ok(())
     }
 
     /// Parse a single metadata tuple operand: an inline `!"string"`
@@ -728,7 +812,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
     /// round-trippable.
     fn parse_md_tuple_operand(&mut self) -> ParseResult<llvmkit_ir::metadata::MetadataRef> {
         use llvmkit_ir::metadata::MetadataRef;
-
         self.expect_exclaim("'!' in metadata tuple operand")?;
         match self.peek() {
             Token::StringConstant(_) => {
@@ -736,8 +819,9 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 Ok(MetadataRef(self.module.metadata_string(s)))
             }
             _ => {
+                let loc = self.loc();
                 let slot = self.parse_uint32("metadata operand number")?;
-                Ok(MetadataRef(self.resolve_md_slot(slot)))
+                Ok(MetadataRef(self.resolve_md_slot(slot, loc)))
             }
         }
     }
@@ -774,27 +858,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             match self.peek() {
                 Token::MetadataVar(_) => {
                     self.bump()?; // eat `!name`
-                    // Consume the metadata value: `!N` or `!{...}` or `!"str"`
-                    if matches!(self.peek(), Token::Exclaim) {
-                        self.bump()?; // eat `!`
-                        match self.peek() {
-                            Token::IntegerLit(_) => { self.bump()?; }
-                            Token::LBrace => {
-                                self.bump()?;
-                                let mut depth = 1u32;
-                                while depth > 0 {
-                                    match self.peek() {
-                                        Token::LBrace => { depth += 1; self.bump()?; }
-                                        Token::RBrace => { depth -= 1; self.bump()?; }
-                                        Token::Eof => break,
-                                        _ => { self.bump()?; }
-                                    }
-                                }
-                            }
-                            Token::StringConstant(_) => { self.bump()?; }
-                            _ => {}
-                        }
-                    }
+                    self.parse_metadata_attachment_operand()?;
                 }
                 _ => break, // comma was not followed by metadata; stop
             }
@@ -803,24 +867,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         while matches!(self.peek(), Token::MetadataVar(_)) {
             self.bump()?; // eat `!name`
             if matches!(self.peek(), Token::Exclaim) {
-                self.bump()?; // eat `!`
-                match self.peek() {
-                    Token::IntegerLit(_) => { self.bump()?; }
-                    Token::LBrace => {
-                        self.bump()?;
-                        let mut depth = 1u32;
-                        while depth > 0 {
-                            match self.peek() {
-                                Token::LBrace => { depth += 1; self.bump()?; }
-                                Token::RBrace => { depth -= 1; self.bump()?; }
-                                Token::Eof => break,
-                                _ => { self.bump()?; }
-                            }
-                        }
-                    }
-                    Token::StringConstant(_) => { self.bump()?; }
-                    _ => {}
-                }
+                self.parse_metadata_attachment_operand()?;
             }
         }
         Ok(())
@@ -1732,9 +1779,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 crate::ll_token::Opcode::FPTrunc => {
                     self.parse_fptrunc(state, b_ref, &result_name)?
                 }
-                crate::ll_token::Opcode::FPExt => {
-                    self.parse_fpext(state, b_ref, &result_name)?
-                }
+                crate::ll_token::Opcode::FPExt => self.parse_fpext(state, b_ref, &result_name)?,
                 crate::ll_token::Opcode::PtrToAddr => {
                     self.parse_ptrtoaddr(state, b_ref, &result_name)?
                 }
@@ -1753,18 +1798,10 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 crate::ll_token::Opcode::InsertValue => {
                     self.parse_insertvalue(state, b_ref, &result_name)?
                 }
-                crate::ll_token::Opcode::Phi => {
-                    self.parse_phi(state, b_ref, &result_name)?
-                }
-                crate::ll_token::Opcode::Call => {
-                    self.parse_call(state, b_ref, &result_name)?
-                }
-                crate::ll_token::Opcode::VAArg => {
-                    self.parse_vaarg(state, b_ref, &result_name)?
-                }
-                crate::ll_token::Opcode::Freeze => {
-                    self.parse_freeze(state, b_ref, &result_name)?
-                }
+                crate::ll_token::Opcode::Phi => self.parse_phi(state, b_ref, &result_name)?,
+                crate::ll_token::Opcode::Call => self.parse_call(state, b_ref, &result_name)?,
+                crate::ll_token::Opcode::VAArg => self.parse_vaarg(state, b_ref, &result_name)?,
+                crate::ll_token::Opcode::Freeze => self.parse_freeze(state, b_ref, &result_name)?,
                 crate::ll_token::Opcode::AtomicCmpXchg => {
                     self.parse_cmpxchg(state, b_ref, &result_name)?
                 }
@@ -1905,7 +1942,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         b: &ParsedBlockBuilder<'ctx>,
         op: IntBinOp,
         result_name: &LocalLhs,
-
     ) -> ParseResult<llvmkit_ir::Value<'ctx>> {
         use llvmkit_ir::instr_types::{
             AShrFlags, AddFlags, LShrFlags, MulFlags, OrFlags, SDivFlags, ShlFlags, SubFlags,
@@ -2038,7 +2074,11 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 .map_err(|e| self.builder_err("and", e))?
                 .as_value(),
             IntBinOp::Or => {
-                let flags = if disjoint_or { OrFlags::new().disjoint() } else { OrFlags::new() };
+                let flags = if disjoint_or {
+                    OrFlags::new().disjoint()
+                } else {
+                    OrFlags::new()
+                };
                 b.build_int_or_with_flags::<llvmkit_ir::IntDyn, _, _>(lhs, rhs, flags, name)
                     .map_err(|e| self.builder_err("or", e))?
                     .as_value()
@@ -2050,7 +2090,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         };
         Ok(v)
     }
-
 
     /// `icmp [samesign] PRED TYPE LHS, RHS`. Mirrors `LLParser::parseCompare`.
     fn parse_icmp(
@@ -2096,7 +2135,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         Ok(r.as_value())
     }
 
-
     /// `trunc [nuw] [nsw] TYPE VALUE to TYPE` / `zext [nneg] TYPE VALUE to TYPE` / `sext TYPE VALUE to TYPE`.
     /// Mirrors `LLParser::parseCast`'s integer-cast arm.
     fn parse_int_cast(
@@ -2137,19 +2175,18 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 .map_err(|e| self.builder_err("trunc", e))?
                 .as_value()
             }
-            IntCast::ZExt => {
-                if zext_nneg {
-                    b.build_zext_with_flags_dyn(
-                        src_int, dst_int,
-                        llvmkit_ir::instr_types::ZExtFlags::new().nneg(),
-                        name,
-                    )
-                } else {
-                    b.build_zext_dyn(src_int, dst_int, name)
-                }
-                .map_err(|e| self.builder_err("zext", e))?
-                .as_value()
+            IntCast::ZExt => if zext_nneg {
+                b.build_zext_with_flags_dyn(
+                    src_int,
+                    dst_int,
+                    llvmkit_ir::instr_types::ZExtFlags::new().nneg(),
+                    name,
+                )
+            } else {
+                b.build_zext_dyn(src_int, dst_int, name)
             }
+            .map_err(|e| self.builder_err("zext", e))?
+            .as_value(),
             IntCast::SExt => b
                 .build_sext_dyn(src_int, dst_int, name)
                 .map_err(|e| self.builder_err("sext", e))?
@@ -2208,7 +2245,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         Ok(v.as_value())
     }
 
-
     /// `fneg [nnan ninf ...] TYPE VALUE`. Mirrors `LLParser::parseUnaryOp` for `Instruction::FNeg`.
     fn parse_fneg(
         &mut self,
@@ -2230,7 +2266,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         .map_err(|e| self.builder_err("fneg", e))?;
         Ok(r.as_value())
     }
-
 
     /// `OP [nnan ninf ...] TYPE LHS, RHS` for fadd/fsub/fmul/fdiv/frem.
     /// Mirrors `LLParser::parseArithmetic` FP arm.
@@ -2259,35 +2294,39 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             } else {
                 b.build_fp_add_fmf::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, fmf, name)
             }
-            .map_err(|e| self.builder_err("fadd", e))?.as_value(),
+            .map_err(|e| self.builder_err("fadd", e))?
+            .as_value(),
             FpBinOp::Sub => if fmf.is_empty() {
                 b.build_fp_sub::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, name)
             } else {
                 b.build_fp_sub_fmf::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, fmf, name)
             }
-            .map_err(|e| self.builder_err("fsub", e))?.as_value(),
+            .map_err(|e| self.builder_err("fsub", e))?
+            .as_value(),
             FpBinOp::Mul => if fmf.is_empty() {
                 b.build_fp_mul::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, name)
             } else {
                 b.build_fp_mul_fmf::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, fmf, name)
             }
-            .map_err(|e| self.builder_err("fmul", e))?.as_value(),
+            .map_err(|e| self.builder_err("fmul", e))?
+            .as_value(),
             FpBinOp::Div => if fmf.is_empty() {
                 b.build_fp_div::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, name)
             } else {
                 b.build_fp_div_fmf::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, fmf, name)
             }
-            .map_err(|e| self.builder_err("fdiv", e))?.as_value(),
+            .map_err(|e| self.builder_err("fdiv", e))?
+            .as_value(),
             FpBinOp::Rem => if fmf.is_empty() {
                 b.build_fp_rem::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, name)
             } else {
                 b.build_fp_rem_fmf::<llvmkit_ir::FloatDyn, _, _>(lhs, rhs, fmf, name)
             }
-            .map_err(|e| self.builder_err("frem", e))?.as_value(),
+            .map_err(|e| self.builder_err("frem", e))?
+            .as_value(),
         };
         Ok(v)
     }
-
 
     /// `fcmp [nnan ninf ...] PRED TYPE LHS, RHS`. Mirrors `LLParser::parseCompare` FP arm.
     fn parse_fcmp(
@@ -2341,7 +2380,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         Ok(r)
     }
 
-
     /// `alloca TYPE [, TYPE COUNT] [, align N]`.
     /// Mirrors `LLParser::parseAlloc` (LLParser.cpp ~8540).
     fn parse_alloca(
@@ -2361,7 +2399,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         };
         Ok(r.as_value())
     }
-
 
     /// `load [volatile] TYPE, ptr PTR [, align N]` or
     /// `load atomic [volatile] TYPE, ptr PTR [syncscope("...")] ORDERING, align N`.
@@ -2393,7 +2430,8 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 align,
                 volatile,
             };
-            let v = b.build_load_atomic(ty, ptr, config, result_name.as_str())
+            let v = b
+                .build_load_atomic(ty, ptr, config, result_name.as_str())
                 .map_err(|e| self.builder_err("load", e))?;
             Ok(v)
         } else {
@@ -2413,7 +2451,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             Ok(v)
         }
     }
-
 
     /// `store [volatile] TYPE VALUE, ptr PTR [, align N]` or
     /// `store atomic [volatile] TYPE VALUE, ptr PTR [syncscope("...")] ORDERING, align N`.
@@ -2459,7 +2496,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         Ok(())
     }
 
-
     /// `getelementptr [inbounds] [nuw] [nusw] SOURCE_TY, ptr P, INDEX, INDEX, ...`.
     /// Mirrors `LLParser::parseGetElementPtr` (LLParser.cpp ~8900).
     fn parse_gep(
@@ -2494,11 +2530,16 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             } else {
                 llvmkit_ir::GepNoWrapFlags::empty()
             };
-            if nuw { f |= llvmkit_ir::GepNoWrapFlags::NUW; }
-            if nusw { f |= llvmkit_ir::GepNoWrapFlags::NUSW; }
+            if nuw {
+                f |= llvmkit_ir::GepNoWrapFlags::NUW;
+            }
+            if nusw {
+                f |= llvmkit_ir::GepNoWrapFlags::NUSW;
+            }
             f
         };
-        let v = b.build_gep_with_flags(source_ty, ptr, indices, flags, name)
+        let v = b
+            .build_gep_with_flags(source_ty, ptr, indices, flags, name)
             .map_err(|e| self.builder_err("getelementptr", e))?;
         Ok(v.as_value())
     }
@@ -2638,7 +2679,8 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             IntToFp::UIToFp => {
                 if nneg {
                     b.build_ui_to_fp_with_flags_dyn(
-                        src_int, dst_fp,
+                        src_int,
+                        dst_fp,
                         llvmkit_ir::instr_types::UIToFpFlags::new().nneg(),
                         name,
                     )
@@ -2860,7 +2902,9 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         let mut mask = Vec::new();
         loop {
             let _ety = self.parse_type(false)?;
-            let (neg, val) = self.parse_int_literal().unwrap_or((false, POISON_MASK_ELEM as u64));
+            let (neg, val) = self
+                .parse_int_literal()
+                .unwrap_or((false, POISON_MASK_ELEM as u64));
             let entry: i32 = if neg {
                 -(val as i32)
             } else {
@@ -3074,7 +3118,8 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 PhiValRef::Resolved(v) => {
                     let bb = state.ensure_block(self.module, &bb_name);
                     let tmp_b = llvmkit_ir::IRBuilder::new(self.module);
-                    tmp_b.phi_add_incoming_from_value(phi_val, v, bb)
+                    tmp_b
+                        .phi_add_incoming_from_value(phi_val, v, bb)
                         .map_err(|e| self.builder_err("phi.add_incoming", e))?;
                 }
                 other => {
@@ -3196,7 +3241,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 | Keyword::AmdgpuKernel
                 | Keyword::Tailcc
                 | Keyword::CfguardCheckcc
-                | Keyword::M68kRtdcc
+                | Keyword::M68kRtdcc,
             ) => {
                 self.bump()?;
                 Ok(())
@@ -3234,7 +3279,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                     | Keyword::Swiftasync
                     | Keyword::Initializes
                     | Keyword::Writable
-                    | Keyword::DeadOnUnwind
+                    | Keyword::DeadOnUnwind,
                 ) => {
                     self.bump()?;
                 }
@@ -3275,7 +3320,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                     | Keyword::Memory
                     | Keyword::Willreturn
                     | Keyword::Mustprogress
-                    | Keyword::Nosync
+                    | Keyword::Nosync,
                 ) => {
                     self.bump()?;
                 }
@@ -3442,7 +3487,10 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             .build_indirectbr(addr_v, "")
             .map_err(|e| self.builder_err("indirectbr", e))?;
         // Destination list: `[ label %dest, ... ]`
-        self.expect_punct(PunctKind::LSquare, "'[' to open indirectbr destination list")?;
+        self.expect_punct(
+            PunctKind::LSquare,
+            "'[' to open indirectbr destination list",
+        )?;
         loop {
             if matches!(self.peek(), Token::RSquare) {
                 self.bump()?;
@@ -3466,10 +3514,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
     /// Mirrors `LLParser::parseFence` (LLParser.cpp ~8476).
     ///
     /// Upstream: `test/Assembler/fence.ll`.
-    fn parse_fence(
-        &mut self,
-        b: &ParsedBlockBuilder<'ctx>,
-    ) -> ParseResult<()> {
+    fn parse_fence(&mut self, b: &ParsedBlockBuilder<'ctx>) -> ParseResult<()> {
         let sync_scope = self.parse_optional_syncscope()?;
         let ordering = self.parse_atomic_ordering("fence ordering")?;
         let _ = b
@@ -3512,8 +3557,12 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             sync_scope,
             flags: {
                 let mut f = llvmkit_ir::instr_types::CmpXchgFlags::new();
-                if weak { f = f.weak(); }
-                if volatile { f = f.volatile(); }
+                if weak {
+                    f = f.weak();
+                }
+                if volatile {
+                    f = f.volatile();
+                }
                 f
             },
             align: align
@@ -3555,7 +3604,9 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
             sync_scope,
             flags: {
                 let mut f = llvmkit_ir::instr_types::AtomicRMWFlags::new();
-                if volatile { f = f.volatile(); }
+                if volatile {
+                    f = f.volatile();
+                }
                 f
             },
             align: align
@@ -4090,11 +4141,8 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 match ty.into_type_enum() {
                     AnyTypeEnum::Int(t) => Ok(t.const_zero().as_value()),
                     AnyTypeEnum::Pointer(t) => Ok(t.const_null().as_value()),
-                    AnyTypeEnum::Float(t) => {
-                        Ok(t.const_from_bits(0).as_value())
-                    }
-                    _ => Err(self
-                        .expected("zeroinitializer for the modeled scalar types")),
+                    AnyTypeEnum::Float(t) => Ok(t.const_from_bits(0).as_value()),
+                    _ => Err(self.expected("zeroinitializer for the modeled scalar types")),
                 }
             }
             Token::Kw(Keyword::Undef) => {
@@ -4145,18 +4193,7 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
                 if !ty.is_metadata() {
                     return Err(self.expected("`metadata` type for a metadata operand"));
                 }
-                self.bump()?; // consume '!'
-                let id = match self.peek() {
-                    Token::StringConstant(_) => {
-                        let s = self.parse_string_constant("metadata string")?;
-                        self.module.metadata_string(s)
-                    }
-                    _ => {
-                        let slot = self.parse_uint32("metadata slot number after '!'")?;
-                        self.resolve_md_slot(slot)
-                    }
-                };
-                Ok(self.module.metadata_as_value(id))
+                self.parse_metadata_value_operand()
             }
             _ => Err(self.expected("operand value")),
         }
@@ -4172,41 +4209,29 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
         let bits: u128 = match self.peek() {
             Token::FloatLit(fp) => match *fp {
                 FpLit::Decimal(s) => {
-                    let val: f64 = s.parse().map_err(|_| {
-                        self.expected("valid decimal float literal")
-                    })?;
+                    let val: f64 = s
+                        .parse()
+                        .map_err(|_| self.expected("valid decimal float literal"))?;
                     u128::from(val.to_bits())
                 }
-                FpLit::HexDouble(s) => {
-                    u128::from(u64::from_str_radix(s, 16).map_err(|_| {
-                        self.expected("valid hex double literal")
-                    })?)
-                }
-                FpLit::HexHalf(s) => {
-                    u128::from(u16::from_str_radix(s, 16).map_err(|_| {
-                        self.expected("valid hex half literal")
-                    })?)
-                }
-                FpLit::HexBFloat(s) => {
-                    u128::from(u16::from_str_radix(s, 16).map_err(|_| {
-                        self.expected("valid hex bfloat literal")
-                    })?)
-                }
-                FpLit::HexX87(s) => {
-                    u128::from_str_radix(s, 16).map_err(|_| {
-                        self.expected("valid hex x87 literal")
-                    })?
-                }
-                FpLit::HexQuad(s) => {
-                    u128::from_str_radix(s, 16).map_err(|_| {
-                        self.expected("valid hex quad literal")
-                    })?
-                }
-                FpLit::HexPpc128(s) => {
-                    u128::from_str_radix(s, 16).map_err(|_| {
-                        self.expected("valid hex ppc128 literal")
-                    })?
-                }
+                FpLit::HexDouble(s) => u128::from(
+                    u64::from_str_radix(s, 16)
+                        .map_err(|_| self.expected("valid hex double literal"))?,
+                ),
+                FpLit::HexHalf(s) => u128::from(
+                    u16::from_str_radix(s, 16)
+                        .map_err(|_| self.expected("valid hex half literal"))?,
+                ),
+                FpLit::HexBFloat(s) => u128::from(
+                    u16::from_str_radix(s, 16)
+                        .map_err(|_| self.expected("valid hex bfloat literal"))?,
+                ),
+                FpLit::HexX87(s) => u128::from_str_radix(s, 16)
+                    .map_err(|_| self.expected("valid hex x87 literal"))?,
+                FpLit::HexQuad(s) => u128::from_str_radix(s, 16)
+                    .map_err(|_| self.expected("valid hex quad literal"))?,
+                FpLit::HexPpc128(s) => u128::from_str_radix(s, 16)
+                    .map_err(|_| self.expected("valid hex ppc128 literal"))?,
             },
             _ => return Err(self.expected("floating-point literal")),
         };
@@ -4218,7 +4243,6 @@ impl<'src, 'ctx> Parser<'src, 'ctx> {
 // ── Helper enums ────────────────────────────────────────────────────────────
 
 // ── Function-body helper types ──────────────────────────────────────────────
-
 
 /// Outgoing reference to an incoming phi value that could not be resolved
 /// immediately (forward reference). Resolved by `PerFunctionState::finish`.
@@ -4325,15 +4349,13 @@ impl<'ctx> PerFunctionState<'ctx> {
         for edge in edges {
             let val = match edge.val_ref {
                 PhiValRef::Resolved(v) => v,
-                PhiValRef::Named(ref n) => {
-                    self.local_named.get(n).copied().ok_or_else(|| {
-                        crate::parse_error::ParseError::UndefinedSymbol {
-                            kind: SYMBOL_KIND_LOCAL,
-                            id: crate::parse_error::SymbolId::Named(n.clone()),
-                            loc: DiagLoc::span(edge.loc),
-                        }
-                    })?
-                }
+                PhiValRef::Named(ref n) => self.local_named.get(n).copied().ok_or_else(|| {
+                    crate::parse_error::ParseError::UndefinedSymbol {
+                        kind: SYMBOL_KIND_LOCAL,
+                        id: crate::parse_error::SymbolId::Named(n.clone()),
+                        loc: DiagLoc::span(edge.loc),
+                    }
+                })?,
                 PhiValRef::Numbered(id) => {
                     self.local_numbered.get(&id).copied().ok_or_else(|| {
                         crate::parse_error::ParseError::UndefinedSymbol {
@@ -4356,7 +4378,8 @@ impl<'ctx> PerFunctionState<'ctx> {
             };
             let bb = self.ensure_block(module, &edge.bb_name);
             let tmp_b = llvmkit_ir::IRBuilder::new(module);
-            tmp_b.phi_add_incoming_from_value(edge.phi_val, val, bb)
+            tmp_b
+                .phi_add_incoming_from_value(edge.phi_val, val, bb)
                 .map_err(|e| crate::parse_error::ParseError::Expected {
                     expected: format!("valid phi add_incoming: {e}"),
                     loc: DiagLoc::span(edge.loc),
